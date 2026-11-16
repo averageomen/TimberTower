@@ -4,7 +4,10 @@ import * as THREE from 'three';
 import { soundEngine } from './audio/soundEngine';
 import { GameHUD } from './components/GameHUD';
 import { Lobby } from './components/Lobby';
-import { connectSocket, getServerUrl, getSocket, setServerUrl } from './network/socket';
+import {
+  SupabaseConfig,
+  supabaseMultiplayer,
+} from './network/supabaseClient';
 import { JengaTower } from './scene/JengaTower';
 import {
   ChatMessage,
@@ -51,7 +54,9 @@ export default function App() {
   }, []);
 
   const [mode, setMode] = useState<GameMode>('ONLINE');
-  const [serverUrl, setServerUrlState] = useState<string>(() => getServerUrl());
+  const [supabaseConfig, setSupabaseConfig] = useState<SupabaseConfig>(() =>
+    supabaseMultiplayer.getConfig()
+  );
   const [connected, setConnected] = useState(false);
   const [mySocketId, setMySocketId] = useState<string | null>(null);
   const [onlineRoomState, setOnlineRoomState] = useState<RoomState | null>(null);
@@ -102,114 +107,78 @@ export default function App() {
     }, 2200);
   }, []);
 
-  // Connect Socket.IO client & subscribe to authoritative events
+  // Initialize Supabase Realtime + Postgres room controller
   useEffect(() => {
-    const socket = connectSocket();
-
-    const handleConnect = () => {
-      setConnected(true);
-      setMySocketId(socket.id ?? null);
-    };
-
-    const handleDisconnect = () => {
-      setConnected(false);
-    };
-
-    const handleRoomState = (nextState: RoomState) => {
-      setOnlineRoomState((prev) => {
-        const isFreshMatch =
-          nextState.blocksMovedCount === 0 &&
-          nextState.status === 'PLAYING' &&
-          (!prev || prev.status !== 'PLAYING' || prev.blocksMovedCount > 0);
-        if (isFreshMatch) {
-          remotePhysicsFrames.current.clear();
-          setMatchResetVersion((v) => v + 1);
+    supabaseMultiplayer.initialize({
+      onConnectionChange: (isOnline) => {
+        setConnected(isOnline);
+      },
+      onClientIdChange: (clientId) => {
+        setMySocketId(clientId);
+      },
+      onRoomState: (nextState) => {
+        setOnlineRoomState((prev) => {
+          const isFreshMatch =
+            nextState.blocksMovedCount === 0 &&
+            nextState.status === 'PLAYING' &&
+            (!prev || prev.status !== 'PLAYING' || prev.blocksMovedCount > 0);
+          if (isFreshMatch) {
+            remotePhysicsFrames.current.clear();
+            setMatchResetVersion((v) => v + 1);
+          }
+          return nextState;
+        });
+        setRemoteHoveredBlockId(null);
+        if (nextState.activeBlockId === null) {
+          setRemoteGrabbedBlockId(null);
         }
-        return nextState;
-      });
-      setRemoteHoveredBlockId(null);
-      if (nextState.activeBlockId === null) {
-        setRemoteGrabbedBlockId(null);
-      }
-      setLobbyError(null);
-    };
-
-    const handlePhysicsState = (compactBlocks: CompactBlockTuple[]) => {
-      for (const tuple of compactBlocks) {
-        const [id, x, y, z, qx, qy, qz, qw] = tuple;
-        let entry = remotePhysicsFrames.current.get(id);
-        if (!entry) {
-          entry = {
-            pos: new THREE.Vector3(x, y, z),
-            quat: new THREE.Quaternion(qx, qy, qz, qw),
-          };
-          remotePhysicsFrames.current.set(id, entry);
-        } else {
-          entry.pos.set(x, y, z);
-          entry.quat.set(qx, qy, qz, qw);
+        setLobbyError(null);
+      },
+      onPhysicsState: (compactBlocks) => {
+        for (const tuple of compactBlocks) {
+          const [id, x, y, z, qx, qy, qz, qw] = tuple;
+          let entry = remotePhysicsFrames.current.get(id);
+          if (!entry) {
+            entry = {
+              pos: new THREE.Vector3(x, y, z),
+              quat: new THREE.Quaternion(qx, qy, qz, qw),
+            };
+            remotePhysicsFrames.current.set(id, entry);
+          } else {
+            entry.pos.set(x, y, z);
+            entry.quat.set(qx, qy, qz, qw);
+          }
         }
-      }
-    };
-
-    const handleBlockHovered = (payload: { blockId: number | null; playerId: string }) => {
-      setRemoteHoveredBlockId(payload.blockId);
-    };
-
-    const handleBlockGrabbed = (payload: {
-      blockId: number;
-      playerId: string;
-      committed: boolean;
-    }) => {
-      setRemoteGrabbedBlockId(payload.blockId);
-    };
-
-    const handleChatMessage = (msg: ChatMessage) => {
-      setChatMessages((prev) => [...prev.slice(-60), msg]);
-      if (!msg.system && msg.emoji && !msg.message) {
-        showFloatingEmoji(msg.id, msg.emoji, msg.senderName);
-      }
-    };
-
-    const handleRoomError = (payload: { message: string }) => {
-      setLobbyError(payload.message);
-    };
-
-    socket.on('connect', handleConnect);
-    socket.on('disconnect', handleDisconnect);
-    socket.on('room:state', handleRoomState);
-    socket.on('physics:state', handlePhysicsState);
-    socket.on('block:hovered', handleBlockHovered);
-    socket.on('block:grabbed', handleBlockGrabbed);
-    socket.on('chat:system', handleChatMessage);
-    socket.on('chat:message', handleChatMessage);
-    socket.on('room:error', handleRoomError);
-
-    if (socket.connected) {
-      handleConnect();
-    }
+      },
+      onBlockHovered: (payload) => {
+        setRemoteHoveredBlockId(payload.blockId);
+      },
+      onBlockGrabbed: (payload) => {
+        setRemoteGrabbedBlockId(payload.blockId);
+      },
+      onChatMessage: (msg) => {
+        setChatMessages((prev) => [...prev.slice(-60), msg]);
+        if (!msg.system && msg.emoji && !msg.message) {
+          showFloatingEmoji(msg.id, msg.emoji, msg.senderName);
+        }
+      },
+      onError: (message) => {
+        setLobbyError(message);
+      },
+    });
 
     return () => {
-      socket.off('connect', handleConnect);
-      socket.off('disconnect', handleDisconnect);
-      socket.off('room:state', handleRoomState);
-      socket.off('physics:state', handlePhysicsState);
-      socket.off('block:hovered', handleBlockHovered);
-      socket.off('block:grabbed', handleBlockGrabbed);
-      socket.off('chat:system', handleChatMessage);
-      socket.off('chat:message', handleChatMessage);
-      socket.off('room:error', handleRoomError);
+      void supabaseMultiplayer.leaveRoom();
     };
-  }, [showFloatingEmoji, serverUrl]);
+  }, [showFloatingEmoji]);
 
-  const handleUpdateServerUrl = useCallback((nextUrl: string) => {
-    const normalized = setServerUrl(nextUrl);
-    setConnected(false);
-    setMySocketId(null);
-    setOnlineRoomState(null);
+  const handleSaveSupabaseConfig = useCallback((url: string, anonKey: string) => {
     setLobbyError(null);
+    setOnlineRoomState(null);
     setChatMessages([]);
     remotePhysicsFrames.current.clear();
-    setServerUrlState(normalized);
+    const updated = supabaseMultiplayer.updateConfig(url, anonKey);
+    setSupabaseConfig(updated);
   }, []);
 
   // Turn audio chime when turn shifts to user
@@ -277,8 +246,7 @@ export default function App() {
     setMode('ONLINE');
     setChatMessages([]);
     setLobbyError(null);
-    const socket = connectSocket();
-    socket.emit('room:create', { playerName });
+    void supabaseMultiplayer.createRoom(playerName);
   };
 
   const handleJoinOnlineRoom = (roomId: string, playerName: string) => {
@@ -286,20 +254,17 @@ export default function App() {
     setMode('ONLINE');
     setChatMessages([]);
     setLobbyError(null);
-    const socket = connectSocket();
-    socket.emit('room:join', { roomId, playerName });
+    void supabaseMultiplayer.joinRoom(roomId, playerName);
   };
 
   const handleStartOnlineGame = () => {
     if (!onlineRoomState) return;
     soundEngine.unlock();
-    getSocket().emit('game:start', { roomId: onlineRoomState.roomId });
+    void supabaseMultiplayer.startGame();
   };
 
   const handleLeaveOnlineRoom = () => {
-    const socket = getSocket();
-    socket.disconnect();
-    socket.connect();
+    void supabaseMultiplayer.leaveRoom();
     setOnlineRoomState(null);
     setChatMessages([]);
     remotePhysicsFrames.current.clear();
@@ -327,10 +292,7 @@ export default function App() {
   const handleHoverBlock = useCallback(
     (blockId: number | null) => {
       if (mode !== 'ONLINE' || !onlineRoomState) return;
-      getSocket().emit('block:hover', {
-        roomId: onlineRoomState.roomId,
-        blockId,
-      });
+      supabaseMultiplayer.hoverBlock(blockId);
     },
     [mode, onlineRoomState]
   );
@@ -349,11 +311,7 @@ export default function App() {
       }
 
       if (!onlineRoomState) return;
-      getSocket().emit('block:grab', {
-        roomId: onlineRoomState.roomId,
-        blockId,
-        committed,
-      });
+      supabaseMultiplayer.grabBlock(blockId, committed);
     },
     [mode, onlineRoomState]
   );
@@ -413,13 +371,12 @@ export default function App() {
       }
 
       if (!onlineRoomState) return;
-      getSocket().emit('block:placed', {
-        roomId: onlineRoomState.roomId,
+      void supabaseMultiplayer.placeBlock(
         blockId,
         finalTransform,
         targetLayer,
-        targetSlot,
-      });
+        targetSlot
+      );
     },
     [mode, onlineRoomState]
   );
@@ -427,10 +384,7 @@ export default function App() {
   const handlePhysicsSync = useCallback(
     (compactBlocks: CompactBlockTuple[]) => {
       if (mode !== 'ONLINE' || !onlineRoomState) return;
-      getSocket().emit('physics:sync', {
-        roomId: onlineRoomState.roomId,
-        blocks: compactBlocks,
-      });
+      supabaseMultiplayer.syncPhysics(compactBlocks);
     },
     [mode, onlineRoomState]
   );
@@ -472,11 +426,7 @@ export default function App() {
     }
 
     if (!onlineRoomState) return;
-    const activePlayer = onlineRoomState.players[onlineRoomState.currentTurnIndex];
-    getSocket().emit('game:collapse', {
-      roomId: onlineRoomState.roomId,
-      loserId: activePlayer?.id,
-    });
+    void supabaseMultiplayer.reportCollapse();
   }, [mode, onlineRoomState, clearLocalTimers]);
 
   const handleRematch = useCallback(() => {
@@ -507,7 +457,7 @@ export default function App() {
     }
 
     if (!onlineRoomState) return;
-    getSocket().emit('game:rematch', { roomId: onlineRoomState.roomId });
+    void supabaseMultiplayer.rematch();
   }, [mode, onlineRoomState, clearLocalTimers]);
 
   const handleExitToLobby = useCallback(() => {
@@ -547,11 +497,7 @@ export default function App() {
       }
 
       if (!onlineRoomState) return;
-      getSocket().emit('chat:send', {
-        roomId: onlineRoomState.roomId,
-        message,
-        emoji,
-      });
+      void supabaseMultiplayer.sendChat(message, emoji);
     },
     [mode, localRoomState, onlineRoomState, showFloatingEmoji]
   );
@@ -612,10 +558,10 @@ export default function App() {
           roomState={onlineRoomState}
           mySocketId={mySocketId}
           connected={connected}
-          serverUrl={serverUrl}
+          supabaseConfig={supabaseConfig}
           initialRoomCode={initialRoomCode}
           errorMessage={lobbyError}
-          onUpdateServerUrl={handleUpdateServerUrl}
+          onSaveSupabaseConfig={handleSaveSupabaseConfig}
           onCreateOnlineRoom={handleCreateOnlineRoom}
           onJoinOnlineRoom={handleJoinOnlineRoom}
           onStartOnlineGame={handleStartOnlineGame}

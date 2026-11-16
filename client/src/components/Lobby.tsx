@@ -13,6 +13,7 @@ import {
   Users,
   Wifi,
 } from 'lucide-react';
+import { SupabaseConfig } from '../network/supabaseClient';
 import { RoomState } from '../types';
 
 export async function copyToClipboard(text: string): Promise<boolean> {
@@ -56,10 +57,10 @@ interface LobbyProps {
   roomState: RoomState | null;
   mySocketId: string | null;
   connected: boolean;
-  serverUrl: string;
+  supabaseConfig: SupabaseConfig;
   initialRoomCode: string;
   errorMessage: string | null;
-  onUpdateServerUrl: (url: string) => void;
+  onSaveSupabaseConfig: (url: string, anonKey: string) => void;
   onCreateOnlineRoom: (playerName: string) => void;
   onJoinOnlineRoom: (roomId: string, playerName: string) => void;
   onStartOnlineGame: () => void;
@@ -72,10 +73,10 @@ export function Lobby({
   roomState,
   mySocketId,
   connected,
-  serverUrl,
+  supabaseConfig,
   initialRoomCode,
   errorMessage,
-  onUpdateServerUrl,
+  onSaveSupabaseConfig,
   onCreateOnlineRoom,
   onJoinOnlineRoom,
   onStartOnlineGame,
@@ -86,7 +87,8 @@ export function Lobby({
   const [tab, setTab] = useState<'ONLINE' | 'LOCAL'>('ONLINE');
   const [playerName, setPlayerName] = useState('Builder');
   const [joinCode, setJoinCode] = useState(initialRoomCode);
-  const [serverDraft, setServerDraft] = useState(serverUrl);
+  const [urlDraft, setUrlDraft] = useState(supabaseConfig.url);
+  const [keyDraft, setKeyDraft] = useState(supabaseConfig.anonKey);
   const [showServerConfig, setShowServerConfig] = useState(false);
   const [localPlayers, setLocalPlayers] = useState<string[]>(['Player 1', 'Player 2']);
   const [copiedInvite, setCopiedInvite] = useState(false);
@@ -94,8 +96,9 @@ export function Lobby({
   const inviteInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    setServerDraft(serverUrl);
-  }, [serverUrl]);
+    setUrlDraft(supabaseConfig.url);
+    setKeyDraft(supabaseConfig.anonKey);
+  }, [supabaseConfig.url, supabaseConfig.anonKey]);
 
   const isHost = Boolean(
     roomState && mySocketId && roomState.players.find((p) => p.id === mySocketId)?.isHost
@@ -157,7 +160,7 @@ export function Lobby({
             <button
               type="button"
               onClick={() => setShowServerConfig((v) => !v)}
-              title="Configure backend server URL"
+              title="Configure Supabase connection"
               className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition hover:brightness-110 ${
                 connected
                   ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30'
@@ -165,57 +168,58 @@ export function Lobby({
               }`}
             >
               <Wifi className="h-3 w-3" />
-              {connected ? 'Server Online' : 'Connecting...'}
+              {connected
+                ? 'Supabase Online'
+                : supabaseConfig.isConfigured
+                  ? 'Connecting...'
+                  : 'Setup Supabase'}
             </button>
           </div>
         </div>
 
         <div className="p-6">
-          {(showServerConfig || (!connected && tab === 'ONLINE' && !roomState)) && (
-            <div className="mb-4 rounded-xl border border-stone-700/80 bg-stone-950/75 p-3">
-              <div className="mb-1.5 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-stone-400">
+          {(showServerConfig || (!supabaseConfig.isConfigured && tab === 'ONLINE' && !roomState)) && (
+            <div className="mb-4 space-y-2.5 rounded-xl border border-stone-700/80 bg-stone-950/75 p-3.5">
+              <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-stone-400">
                 <span className="flex items-center gap-1.5">
                   <Server className="h-3.5 w-3.5 text-amber-400" />
-                  Backend Server URL (NAS / Docker)
+                  Supabase Backend Setup
                 </span>
                 <span className="font-mono text-[10px] text-stone-500">
-                  {connected ? 'Connected' : 'Offline'}
+                  {connected ? 'Connected' : 'Not Connected'}
                 </span>
               </div>
+              <input
+                type="text"
+                value={urlDraft}
+                onChange={(e) => setUrlDraft(e.target.value)}
+                placeholder="https://your-project-ref.supabase.co"
+                className="w-full rounded-lg border border-stone-700 bg-stone-900 px-3 py-1.5 font-mono text-xs text-stone-100 outline-none focus:border-amber-400"
+              />
               <div className="flex gap-2">
                 <input
-                  type="text"
-                  value={serverDraft}
-                  onChange={(e) => setServerDraft(e.target.value)}
+                  type="password"
+                  value={keyDraft}
+                  onChange={(e) => setKeyDraft(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && serverDraft.trim()) {
-                      onUpdateServerUrl(serverDraft);
+                    if (e.key === 'Enter' && urlDraft.trim() && keyDraft.trim()) {
+                      onSaveSupabaseConfig(urlDraft, keyDraft);
                     }
                   }}
-                  placeholder="http://100.x.y.z:3001"
+                  placeholder="Supabase Anon Public Key"
                   className="flex-1 rounded-lg border border-stone-700 bg-stone-900 px-3 py-1.5 font-mono text-xs text-stone-100 outline-none focus:border-amber-400"
                 />
                 <button
                   type="button"
-                  onClick={() => onUpdateServerUrl(serverDraft)}
+                  onClick={() => onSaveSupabaseConfig(urlDraft, keyDraft)}
                   className="rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs font-semibold text-amber-200 ring-1 ring-amber-400/40 transition hover:bg-amber-500/30"
                 >
-                  Connect
+                  Save &amp; Connect
                 </button>
               </div>
-              {!connected && (
-                <div className="mt-2 flex items-center justify-between text-[11px] text-stone-400">
-                  <span>Playing over Tailscale? Make sure Tailscale is running.</span>
-                  <a
-                    href="https://tailscale.com/download"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="font-medium text-amber-300 underline decoration-amber-400/40 hover:text-amber-200"
-                  >
-                    Get Tailscale
-                  </a>
-                </div>
-              )}
+              <p className="text-[11px] text-stone-400">
+                Run <span className="font-mono text-amber-300/90">supabase/schema.sql</span> in your Supabase SQL Editor first.
+              </p>
             </div>
           )}
 
@@ -275,7 +279,7 @@ export function Lobby({
                   />
                   {!isWebHttp && (
                     <div className="text-[11px] text-amber-200/75">
-                      Server: <span className="font-mono">{serverUrl}</span>
+                      Share Room Code <span className="font-mono font-semibold">{roomState.roomId}</span> with friends using this app.
                     </div>
                   )}
                   {copyFallbackHint && (
