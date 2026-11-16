@@ -1,6 +1,6 @@
 {
   "name": "jenga-3d-multiplayer",
-  "version": "1.0.0",
+  "version": "1.0.6",
   "private": true,
   "description": "Full-stack multiplayer 3D Jenga web application with Rapier physics, procedural audio, and Socket.IO",
   "scripts": {
