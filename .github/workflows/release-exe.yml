@@ -37,6 +37,15 @@ jobs:
       - name: Install client dependencies
         run: npm --prefix client install
 
+      - name: Sync client version with release tag
+        shell: pwsh
+        run: |
+          $rawTag = "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}"
+          if ($rawTag -match '^v?(\d+\.\d+\.\d+.*)$') {
+            $ver = $Matches[1]
+            npm --prefix client version $ver --no-git-tag-version --allow-same-version
+          }
+
       - name: Build Windows portable & installer .exe
         env:
           VITE_SUPABASE_URL: ${{ inputs.supabase_url || vars.VITE_SUPABASE_URL }}

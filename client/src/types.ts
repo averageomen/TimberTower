@@ -8,6 +8,8 @@ export type GameOverReason =
 
 export type GameMode = 'ONLINE' | 'LOCAL';
 
+export type GameRulesMode = 'CLASSIC' | 'ELIMINATION';
+
 export type Vec3 = [number, number, number];
 export type Quat = [number, number, number, number];
 
@@ -28,6 +30,7 @@ export interface Player {
   score: number;
   isHost: boolean;
   connected: boolean;
+  eliminated?: boolean;
 }
 
 export interface BlockState {
@@ -42,6 +45,7 @@ export interface BlockState {
 export interface RoomState {
   roomId: string;
   status: RoomStatus;
+  rulesMode: GameRulesMode;
   players: Player[];
   currentTurnIndex: number;
   startingPlayerIndex: number;
@@ -52,6 +56,10 @@ export interface RoomState {
   activeBlockId: number | null;
   blocksMovedCount: number;
   blocks: BlockState[];
+  lastStableBlocks: BlockState[];
+  towerRestoreVersion: number;
+  lastEliminatedPlayerId: string | null;
+  lastEliminatedAt: number | null;
   winnerId: string | null;
   loserId: string | null;
   gameOverReason: GameOverReason;
@@ -116,6 +124,14 @@ export function createInitialBlocks(): BlockState[] {
     }
   }
   return blocks;
+}
+
+export function cloneBlocks(blocks: BlockState[]): BlockState[] {
+  return blocks.map((b) => ({
+    ...b,
+    position: [b.position[0], b.position[1], b.position[2]],
+    quaternion: [b.quaternion[0], b.quaternion[1], b.quaternion[2], b.quaternion[3]],
+  }));
 }
 
 export function getHighestOccupiedLayer(

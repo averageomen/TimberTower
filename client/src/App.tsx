@@ -10,10 +10,13 @@ import {
 } from './network/supabaseClient';
 import { JengaTower } from './scene/JengaTower';
 import {
+  BlockState,
   ChatMessage,
+  cloneBlocks,
   CompactBlockTuple,
   createInitialBlocks,
   GameMode,
+  GameRulesMode,
   Quat,
   RoomState,
   SETTLING_DURATION_MS,
@@ -21,16 +24,22 @@ import {
   Vec3,
 } from './types';
 
-function createLocalRoomState(playerNames: string[]): RoomState {
+function createLocalRoomState(
+  playerNames: string[],
+  rulesMode: GameRulesMode
+): RoomState {
+  const initialBlocks = createInitialBlocks();
   return {
     roomId: 'LOCAL',
     status: 'PLAYING',
+    rulesMode,
     players: playerNames.map((name, idx) => ({
       id: `local-${idx}`,
       name,
       score: 0,
       isHost: idx === 0,
       connected: true,
+      eliminated: false,
     })),
     currentTurnIndex: 0,
     startingPlayerIndex: 0,
@@ -40,11 +49,28 @@ function createLocalRoomState(playerNames: string[]): RoomState {
     settlingDurationMs: SETTLING_DURATION_MS,
     activeBlockId: null,
     blocksMovedCount: 0,
-    blocks: createInitialBlocks(),
+    blocks: initialBlocks,
+    lastStableBlocks: cloneBlocks(initialBlocks),
+    towerRestoreVersion: 1,
+    lastEliminatedPlayerId: null,
+    lastEliminatedAt: null,
     winnerId: null,
     loserId: null,
     gameOverReason: null,
   };
+}
+
+function findNextAliveLocalIndex(
+  players: RoomState['players'],
+  fromIndex: number
+): number {
+  const count = players.length;
+  if (count === 0) return 0;
+  for (let offset = 1; offset <= count; offset++) {
+    const idx = (fromIndex + offset) % count;
+    if (!players[idx]?.eliminated) return idx;
+  }
+  return (fromIndex + 1) % count;
 }
 
 export default function App() {
@@ -83,6 +109,10 @@ export default function App() {
   const localSettlingTimeoutRef = useRef<number | null>(null);
   const reactionTimeoutRef = useRef<number | null>(null);
   const prevTurnMarkerRef = useRef<string | null>(null);
+  const lastExplosionAtRef = useRef<number | null>(null);
+  const latestLocalSimTransformsRef = useRef<Map<number, { position: Vec3; quaternion: Quat }>>(
+    new Map()
+  );
 
   const activeRoomState = mode === 'LOCAL' ? localRoomState : onlineRoomState;
 
@@ -181,11 +211,20 @@ export default function App() {
     setSupabaseConfig(updated);
   }, []);
 
+  // Trigger explosion audio when a player is eliminated in Elimination Tower mode
+  useEffect(() => {
+    const eliminatedAt = activeRoomState?.lastEliminatedAt ?? null;
+    if (eliminatedAt && eliminatedAt !== lastExplosionAtRef.current) {
+      lastExplosionAtRef.current = eliminatedAt;
+      soundEngine.playExplosion();
+    }
+  }, [activeRoomState?.lastEliminatedAt]);
+
   // Turn audio chime when turn shifts to user
   useEffect(() => {
     if (!activeRoomState || activeRoomState.status !== 'PLAYING') return;
     const activePlayer = activeRoomState.players[activeRoomState.currentTurnIndex];
-    const marker = `${activeRoomState.roomId}-${activeRoomState.blocksMovedCount}-${activePlayer?.id}`;
+    const marker = `${activeRoomState.roomId}-${activeRoomState.blocksMovedCount}-${activeRoomState.towerRestoreVersion}-${activePlayer?.id}`;
     if (prevTurnMarkerRef.current !== marker) {
       prevTurnMarkerRef.current = marker;
       if (mode === 'LOCAL' || activePlayer?.id === mySocketId) {
@@ -193,6 +232,62 @@ export default function App() {
       }
     }
   }, [activeRoomState, mode, mySocketId]);
+
+  const applyLocalElimination = useCallback((reasonLabel: string) => {
+    setLocalRoomState((prev) => {
+      if (!prev || (prev.status !== 'PLAYING' && prev.status !== 'SETTLING')) return prev;
+      const loser = prev.players[prev.currentTurnIndex];
+      const updatedPlayers = prev.players.map((p, idx) =>
+        idx === prev.currentTurnIndex ? { ...p, eliminated: true } : p
+      );
+      const alivePlayers = updatedPlayers.filter((p) => !p.eliminated);
+      const now = Date.now();
+
+      if (prev.rulesMode === 'ELIMINATION' && alivePlayers.length >= 2) {
+        const restored = cloneBlocks(
+          prev.lastStableBlocks.length > 0 ? prev.lastStableBlocks : createInitialBlocks()
+        );
+        const nextTurn = findNextAliveLocalIndex(updatedPlayers, prev.currentTurnIndex);
+        latestLocalSimTransformsRef.current.clear();
+        return {
+          ...prev,
+          status: 'PLAYING',
+          players: updatedPlayers,
+          currentTurnIndex: nextTurn,
+          turnStartedAt: now,
+          settlingStartedAt: null,
+          activeBlockId: null,
+          blocks: restored,
+          lastStableBlocks: cloneBlocks(restored),
+          towerRestoreVersion: prev.towerRestoreVersion + 1,
+          lastEliminatedPlayerId: loser?.id ?? null,
+          lastEliminatedAt: now,
+        };
+      }
+
+      const winner =
+        alivePlayers[0] ??
+        (() => {
+          const candidates = prev.players.filter((p) => p.id !== loser?.id);
+          return candidates.length > 0
+            ? [...candidates].sort((a, b) => b.score - a.score)[0]
+            : null;
+        })();
+
+      return {
+        ...prev,
+        status: 'GAME_OVER',
+        players: updatedPlayers,
+        settlingStartedAt: null,
+        activeBlockId: null,
+        lastEliminatedPlayerId: prev.rulesMode === 'ELIMINATION' ? loser?.id ?? null : null,
+        lastEliminatedAt: prev.rulesMode === 'ELIMINATION' ? now : null,
+        loserId: loser?.id ?? null,
+        winnerId: winner?.id ?? null,
+        gameOverReason: reasonLabel === 'TIMEOUT' ? 'TIMEOUT' : 'TOWER_COLLAPSED',
+      };
+    });
+  }, []);
 
   // Local mode 45s turn timer
   useEffect(() => {
@@ -208,22 +303,23 @@ export default function App() {
       const elapsed = Date.now() - localRoomState.turnStartedAt;
       const remaining = Math.max(0, localRoomState.turnDurationMs - elapsed);
       localTurnTimeoutRef.current = window.setTimeout(() => {
-        setLocalRoomState((prev) => {
-          if (!prev || prev.status !== 'PLAYING') return prev;
-          const loser = prev.players[prev.currentTurnIndex];
-          const winner =
-            prev.players.length > 1
-              ? prev.players.find((p) => p.id !== loser?.id) ?? null
-              : null;
-          return {
-            ...prev,
-            status: 'GAME_OVER',
-            activeBlockId: null,
-            loserId: loser?.id ?? null,
-            winnerId: winner?.id ?? null,
-            gameOverReason: 'TIMEOUT',
-          };
-        });
+        const currentPlayer = localRoomState.players[localRoomState.currentTurnIndex];
+        applyLocalElimination('TIMEOUT');
+        setChatMessages((prev) => [
+          ...prev.slice(-60),
+          {
+            id: `timeout-${Date.now()}`,
+            senderId: 'system',
+            senderName: 'Jenga Referee',
+            message:
+              localRoomState.rulesMode === 'ELIMINATION'
+                ? `${currentPlayer?.name ?? 'Player'} ran out of time and was ELIMINATED!`
+                : `${currentPlayer?.name ?? 'Player'} ran out of time!`,
+            emoji: localRoomState.rulesMode === 'ELIMINATION' ? '💥' : '⏰',
+            system: true,
+            timestamp: Date.now(),
+          },
+        ]);
       }, remaining);
     }
 
@@ -239,6 +335,7 @@ export default function App() {
     localRoomState?.currentTurnIndex,
     localRoomState?.turnStartedAt,
     clearLocalTimers,
+    applyLocalElimination,
   ]);
 
   const handleCreateOnlineRoom = (playerName: string) => {
@@ -270,22 +367,30 @@ export default function App() {
     remotePhysicsFrames.current.clear();
   };
 
-  const handleStartLocalGame = (playerNames: string[]) => {
+  const handleSetOnlineRulesMode = (rulesMode: GameRulesMode) => {
+    void supabaseMultiplayer.setRulesMode(rulesMode);
+  };
+
+  const handleStartLocalGame = (playerNames: string[], rulesMode: GameRulesMode) => {
     soundEngine.unlock();
     clearLocalTimers();
+    latestLocalSimTransformsRef.current.clear();
     setMode('LOCAL');
     setChatMessages([
       {
         id: `local-start-${Date.now()}`,
         senderId: 'system',
         senderName: 'Jenga Referee',
-        message: `Local match started with ${playerNames.join(', ')}!`,
-        emoji: '🪵',
+        message:
+          rulesMode === 'ELIMINATION'
+            ? `Elimination Tower started with ${playerNames.join(', ')}!`
+            : `Local match started with ${playerNames.join(', ')}!`,
+        emoji: rulesMode === 'ELIMINATION' ? '💥' : '🪵',
         system: true,
         timestamp: Date.now(),
       },
     ]);
-    setLocalRoomState(createLocalRoomState(playerNames));
+    setLocalRoomState(createLocalRoomState(playerNames, rulesMode));
     setMatchResetVersion((v) => v + 1);
   };
 
@@ -358,12 +463,20 @@ export default function App() {
         localSettlingTimeoutRef.current = window.setTimeout(() => {
           setLocalRoomState((prev) => {
             if (!prev || prev.status !== 'SETTLING') return prev;
+            const settledBlocks: BlockState[] = prev.blocks.map((b) => {
+              const live = latestLocalSimTransformsRef.current.get(b.id);
+              return live
+                ? { ...b, position: live.position, quaternion: live.quaternion }
+                : b;
+            });
             return {
               ...prev,
               status: 'PLAYING',
               settlingStartedAt: null,
               turnStartedAt: Date.now(),
-              currentTurnIndex: (prev.currentTurnIndex + 1) % prev.players.length,
+              currentTurnIndex: findNextAliveLocalIndex(prev.players, prev.currentTurnIndex),
+              blocks: settledBlocks,
+              lastStableBlocks: cloneBlocks(settledBlocks),
             };
           });
         }, SETTLING_DURATION_MS);
@@ -383,7 +496,18 @@ export default function App() {
 
   const handlePhysicsSync = useCallback(
     (compactBlocks: CompactBlockTuple[]) => {
-      if (mode !== 'ONLINE' || !onlineRoomState) return;
+      if (mode === 'LOCAL') {
+        for (const tuple of compactBlocks) {
+          if (!Array.isArray(tuple) || tuple.length < 8) continue;
+          const [id, x, y, z, qx, qy, qz, qw] = tuple;
+          latestLocalSimTransformsRef.current.set(id, {
+            position: [x, y, z],
+            quaternion: [qx, qy, qz, qw],
+          });
+        }
+        return;
+      }
+      if (!onlineRoomState) return;
       supabaseMultiplayer.syncPhysics(compactBlocks);
     },
     [mode, onlineRoomState]
@@ -392,31 +516,19 @@ export default function App() {
   const handleCollapse = useCallback(() => {
     if (mode === 'LOCAL') {
       clearLocalTimers();
-      setLocalRoomState((prev) => {
-        if (!prev || prev.status === 'GAME_OVER') return prev;
-        const loser = prev.players[prev.currentTurnIndex];
-        const candidates = prev.players.filter((p) => p.id !== loser?.id);
-        const winner =
-          candidates.length > 0
-            ? [...candidates].sort((a, b) => b.score - a.score)[0]
-            : null;
-        return {
-          ...prev,
-          status: 'GAME_OVER',
-          settlingStartedAt: null,
-          activeBlockId: null,
-          loserId: loser?.id ?? null,
-          winnerId: winner?.id ?? null,
-          gameOverReason: 'TOWER_COLLAPSED',
-        };
-      });
+      const activeName =
+        localRoomState?.players[localRoomState.currentTurnIndex]?.name ?? 'Player';
+      const isElim = localRoomState?.rulesMode === 'ELIMINATION';
+      applyLocalElimination('COLLAPSE');
       setChatMessages((prev) => [
         ...prev.slice(-60),
         {
           id: `collapse-${Date.now()}`,
           senderId: 'system',
           senderName: 'Jenga Referee',
-          message: 'TIMBER! The tower collapsed!',
+          message: isElim
+            ? `${activeName} toppled the tower and was ELIMINATED!`
+            : 'TIMBER! The tower collapsed!',
           emoji: '💥',
           system: true,
           timestamp: Date.now(),
@@ -427,15 +539,17 @@ export default function App() {
 
     if (!onlineRoomState) return;
     void supabaseMultiplayer.reportCollapse();
-  }, [mode, onlineRoomState, clearLocalTimers]);
+  }, [mode, localRoomState, onlineRoomState, clearLocalTimers, applyLocalElimination]);
 
   const handleRematch = useCallback(() => {
     soundEngine.unlock();
     if (mode === 'LOCAL') {
       clearLocalTimers();
+      latestLocalSimTransformsRef.current.clear();
       setLocalRoomState((prev) => {
         if (!prev) return prev;
         const nextStarter = (prev.startingPlayerIndex + 1) % prev.players.length;
+        const freshBlocks = createInitialBlocks();
         return {
           ...prev,
           status: 'PLAYING',
@@ -445,8 +559,12 @@ export default function App() {
           settlingStartedAt: null,
           activeBlockId: null,
           blocksMovedCount: 0,
-          players: prev.players.map((p) => ({ ...p, score: 0 })),
-          blocks: createInitialBlocks(),
+          players: prev.players.map((p) => ({ ...p, score: 0, eliminated: false })),
+          blocks: freshBlocks,
+          lastStableBlocks: cloneBlocks(freshBlocks),
+          towerRestoreVersion: prev.towerRestoreVersion + 1,
+          lastEliminatedPlayerId: null,
+          lastEliminatedAt: null,
           winnerId: null,
           loserId: null,
           gameOverReason: null,
@@ -543,7 +661,7 @@ export default function App() {
             remoteHoveredBlockId={remoteHoveredBlockId}
             remoteGrabbedBlockId={remoteGrabbedBlockId}
             remotePhysicsFrames={remotePhysicsFrames}
-            matchResetVersion={matchResetVersion}
+            matchResetVersion={matchResetVersion + (activeRoomState?.towerRestoreVersion ?? 0)}
             cameraResetTrigger={cameraResetTrigger}
             onHoverBlock={handleHoverBlock}
             onGrabBlock={handleGrabBlock}
@@ -563,6 +681,7 @@ export default function App() {
           initialRoomCode={initialRoomCode}
           errorMessage={lobbyError}
           onSaveSupabaseConfig={handleSaveSupabaseConfig}
+          onSetOnlineRulesMode={handleSetOnlineRulesMode}
           onCreateOnlineRoom={handleCreateOnlineRoom}
           onJoinOnlineRoom={handleJoinOnlineRoom}
           onStartOnlineGame={handleStartOnlineGame}

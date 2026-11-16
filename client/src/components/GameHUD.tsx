@@ -4,6 +4,7 @@ import {
   Check,
   Clock,
   Copy,
+  Flame,
   Layers,
   LogOut,
   MessageSquare,
@@ -55,8 +56,22 @@ export function GameHUD({
   const [chatOpen, setChatOpen] = useState(true);
   const [chatInput, setChatInput] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
+  const [eliminationBanner, setEliminationBanner] = useState<string | null>(null);
   const lastTickSecondRef = useRef<number | null>(null);
+  const lastElimShownRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const elimAt = roomState.lastEliminatedAt;
+    if (!elimAt || elimAt === lastElimShownRef.current) return;
+    lastElimShownRef.current = elimAt;
+    const elimPlayer = roomState.players.find(
+      (p) => p.id === roomState.lastEliminatedPlayerId
+    );
+    setEliminationBanner(elimPlayer?.name ?? 'A player');
+    const timer = window.setTimeout(() => setEliminationBanner(null), 3400);
+    return () => window.clearTimeout(timer);
+  }, [roomState.lastEliminatedAt, roomState.lastEliminatedPlayerId, roomState.players]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -161,37 +176,55 @@ export function GameHUD({
               <span>Layers:</span>
               <span className="font-bold text-stone-100">{highestLayer + 1}</span>
             </div>
+
+            {roomState.rulesMode === 'ELIMINATION' && (
+              <div className="flex items-center gap-1.5 rounded-xl border border-orange-500/40 bg-orange-950/75 px-3 py-1.5 text-xs font-semibold text-orange-200 backdrop-blur-md">
+                <Flame className="h-3.5 w-3.5 text-orange-400" />
+                Elimination Tower
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap gap-2">
             {roomState.players.map((player, idx) => {
-              const isTurn = idx === roomState.currentTurnIndex && roomState.status !== 'GAME_OVER';
+              const isTurn =
+                idx === roomState.currentTurnIndex &&
+                roomState.status !== 'GAME_OVER' &&
+                !player.eliminated;
               const isMe = mode === 'ONLINE' && player.id === mySocketId;
               return (
                 <div
                   key={player.id}
                   className={`flex items-center gap-2 rounded-xl border px-3 py-1.5 text-xs backdrop-blur-md transition ${
-                    isTurn
-                      ? 'border-amber-400/80 bg-amber-950/80 text-amber-100 shadow-lg shadow-amber-500/15'
-                      : 'border-stone-700/70 bg-stone-900/75 text-stone-300'
+                    player.eliminated
+                      ? 'border-red-900/60 bg-red-950/40 text-stone-500 opacity-70'
+                      : isTurn
+                        ? 'border-amber-400/80 bg-amber-950/80 text-amber-100 shadow-lg shadow-amber-500/15'
+                        : 'border-stone-700/70 bg-stone-900/75 text-stone-300'
                   }`}
                 >
                   <span
                     className={`h-2 w-2 rounded-full ${
-                      !player.connected
+                      player.eliminated || !player.connected
                         ? 'bg-red-500'
                         : isTurn
                           ? 'animate-pulse bg-amber-400'
                           : 'bg-emerald-400'
                     }`}
                   />
-                  <span className="font-semibold">
+                  <span className={`font-semibold ${player.eliminated ? 'line-through' : ''}`}>
                     {player.name}
                     {isMe ? ' (You)' : ''}
                   </span>
-                  <span className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[11px] text-amber-300">
-                    {player.score}
-                  </span>
+                  {player.eliminated ? (
+                    <span className="rounded bg-red-900/70 px-1.5 py-0.5 text-[10px] font-bold uppercase text-red-200">
+                      Out
+                    </span>
+                  ) : (
+                    <span className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[11px] text-amber-300">
+                      {player.score}
+                    </span>
+                  )}
                 </div>
               );
             })}
@@ -237,7 +270,7 @@ export function GameHUD({
             {roomState.status === 'PLAYING' && (
               <div className="mt-1.5 text-[11px] text-stone-400">
                 {roomState.activeBlockId !== null
-                  ? `Single-block lock active (#${roomState.activeBlockId + 1}) — stack it on top`
+                  ? `Block #${roomState.activeBlockId + 1} locked — R / Right-Click: Rotate • F: Flip on Side`
                   : isMyTurn
                     ? 'Pull any block below the top layer'
                     : 'Watch your opponent move'}
@@ -291,6 +324,23 @@ export function GameHUD({
             </div>
             <div className="mt-1 text-xs text-stone-400">
               Hands off while checking stability
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Center Overlay: Elimination Blast Alert */}
+      {eliminationBanner && roomState.status !== 'GAME_OVER' && (
+        <div className="pointer-events-none flex items-center justify-center">
+          <div className="animate-pulse rounded-2xl border border-red-500/70 bg-red-950/90 px-6 py-4 text-center shadow-2xl backdrop-blur-md">
+            <div className="text-xs font-bold uppercase tracking-[0.2em] text-red-300">
+              Player Eliminated!
+            </div>
+            <div className="mt-1 text-2xl font-extrabold text-white">
+              💥 {eliminationBanner} is OUT!
+            </div>
+            <div className="mt-1 text-xs text-red-200/80">
+              Tower restored to last playable state
             </div>
           </div>
         </div>
@@ -420,16 +470,20 @@ export function GameHUD({
             </div>
 
             <h2 className="text-2xl font-extrabold text-amber-50">
-              {roomState.gameOverReason === 'TIMEOUT'
-                ? "TIME'S UP!"
-                : roomState.gameOverReason === 'PLAYER_DISCONNECTED'
-                  ? 'MATCH FORFEITED'
-                  : 'TIMBER!'}
+              {roomState.rulesMode === 'ELIMINATION'
+                ? 'LAST BUILDER STANDING!'
+                : roomState.gameOverReason === 'TIMEOUT'
+                  ? "TIME'S UP!"
+                  : roomState.gameOverReason === 'PLAYER_DISCONNECTED'
+                    ? 'MATCH FORFEITED'
+                    : 'TIMBER!'}
             </h2>
 
             <p className="mt-1 text-sm text-stone-300">
               {winner
-                ? `${winner.name} wins the round!`
+                ? roomState.rulesMode === 'ELIMINATION'
+                  ? `${winner.name} survived Elimination Tower!`
+                  : `${winner.name} wins the round!`
                 : loser
                   ? `${loser.name} toppled the tower after ${roomState.blocksMovedCount} moves.`
                   : 'The tower collapsed!'}

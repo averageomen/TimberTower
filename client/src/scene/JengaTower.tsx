@@ -58,6 +58,118 @@ interface DragSession {
   alignedWithSlot: boolean;
   stagePoint: THREE.Vector3 | null;
   freePlacePos: Vec3 | null;
+  yawSteps: number;
+  isOnSide: boolean;
+  hasCustomRotation: boolean;
+  targetQuat: THREE.Quaternion;
+}
+
+const _rotMatrix = new THREE.Matrix4();
+
+function getWorldHalfExtents(quat: THREE.Quaternion): {
+  hx: number;
+  hy: number;
+  hz: number;
+} {
+  _rotMatrix.makeRotationFromQuaternion(quat);
+  const e = _rotMatrix.elements;
+  const hw = BLOCK_WIDTH / 2;
+  const hh = BLOCK_HEIGHT / 2;
+  const hl = BLOCK_LENGTH / 2;
+  return {
+    hx: Math.abs(e[0]) * hw + Math.abs(e[4]) * hh + Math.abs(e[8]) * hl,
+    hy: Math.abs(e[1]) * hw + Math.abs(e[5]) * hh + Math.abs(e[9]) * hl,
+    hz: Math.abs(e[2]) * hw + Math.abs(e[6]) * hh + Math.abs(e[10]) * hl,
+  };
+}
+
+function buildPlacementQuaternion(
+  yawSteps: number,
+  isOnSide: boolean
+): THREE.Quaternion {
+  const euler = new THREE.Euler(
+    0,
+    yawSteps * (Math.PI / 2),
+    isOnSide ? Math.PI / 2 : 0,
+    'YXZ'
+  );
+  return new THREE.Quaternion().setFromEuler(euler);
+}
+
+interface TopBlockBox {
+  x: number;
+  y: number;
+  z: number;
+  hx: number;
+  hy: number;
+  hz: number;
+}
+
+function resolveNonOverlappingPlacement(
+  desiredX: number,
+  desiredZ: number,
+  placedQuat: THREE.Quaternion,
+  baseSlotY: number,
+  nearbyBlocks: TopBlockBox[],
+  allowNudge: boolean
+): { x: number; y: number; z: number } {
+  const { hx, hy, hz } = getWorldHalfExtents(placedQuat);
+  let x = desiredX;
+  let z = desiredZ;
+  const gap = 0.02;
+
+  // Separate horizontally from blocks sitting on the same top layer so blocks never overlap
+  if (allowNudge) {
+    const sameLayerBlocks = nearbyBlocks.filter(
+      (b) => Math.abs(b.y - baseSlotY) < BLOCK_HEIGHT * 0.9
+    );
+
+    for (let pass = 0; pass < 2; pass++) {
+      for (const other of sameLayerBlocks) {
+        const reqX = hx + other.hx + gap;
+        const reqZ = hz + other.hz + gap;
+        const dx = x - other.x;
+        const dz = z - other.z;
+        const ox = reqX - Math.abs(dx);
+        const oz = reqZ - Math.abs(dz);
+
+        if (ox > 0 && oz > 0) {
+          if (ox <= oz && ox < reqX * 0.72) {
+            const signX = dx >= 0 ? 1 : -1;
+            const candidateX = other.x + signX * reqX;
+            if (Math.abs(candidateX) <= 2.35) {
+              x = candidateX;
+            }
+          } else if (oz < ox && oz < reqZ * 0.72) {
+            const signZ = dz >= 0 ? 1 : -1;
+            const candidateZ = other.z + signZ * reqZ;
+            if (Math.abs(candidateZ) <= 2.35) {
+              z = candidateZ;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Compute exact support surface Y beneath (x, z) so overlapping placement stacks on top instead of clipping
+  let supportSurfaceY = Math.max(0, baseSlotY - BLOCK_HEIGHT / 2);
+  for (const other of nearbyBlocks) {
+    const ox = hx + other.hx - Math.abs(x - other.x);
+    const oz = hz + other.hz - Math.abs(z - other.z);
+    if (ox > 0.06 && oz > 0.06) {
+      const topY = other.y + other.hy;
+      if (topY > supportSurfaceY) {
+        supportSurfaceY = topY;
+      }
+    }
+  }
+
+  return {
+    x,
+    y: supportSurfaceY + hy + 0.04,
+    z,
+  };
 }
 
 function GhostPlacementGuides({
@@ -149,6 +261,12 @@ function TowerPhysicsContent({
   const lastSyncSentAtRef = useRef(0);
   const prevDynamicRef = useRef(false);
   const placementDropTimeoutRef = useRef<number | null>(null);
+  const stashedOrientationRef = useRef<{
+    blockId: number;
+    yawSteps: number;
+    isOnSide: boolean;
+    hasCustomRotation: boolean;
+  } | null>(null);
 
   const tempVecA = useMemo(() => new THREE.Vector3(), []);
   const tempVecB = useMemo(() => new THREE.Vector3(), []);
@@ -171,6 +289,7 @@ function TowerPhysicsContent({
     collapseReportedRef.current = false;
     spawnProtectionUntilRef.current = performance.now() + 1000;
     dragSessionRef.current = null;
+    stashedOrientationRef.current = null;
     setDragBlockId(null);
     setDragPhase('IDLE');
     setStashedBlockId(null);
@@ -257,29 +376,36 @@ function TowerPhysicsContent({
 
     if (session.phase === 'PLACING' && session.targetPlacement && session.alignedWithSlot && body) {
       const slot = session.targetPlacement;
+      const finalQuat = session.targetQuat.clone();
       const dropPos: Vec3 = session.freePlacePos ?? [
         slot.position[0],
-        slot.position[1] + 0.06,
+        slot.position[1] + getWorldHalfExtents(finalQuat).hy - BLOCK_HEIGHT / 2 + 0.05,
         slot.position[2],
       ];
       body.setTranslation({ x: dropPos[0], y: dropPos[1], z: dropPos[2] }, true);
       body.setRotation(
         {
-          x: slot.quaternion[0],
-          y: slot.quaternion[1],
-          z: slot.quaternion[2],
-          w: slot.quaternion[3],
+          x: finalQuat.x,
+          y: finalQuat.y,
+          z: finalQuat.z,
+          w: finalQuat.w,
         },
         true
       );
       body.wakeUp();
 
       soundEngine.playPlace();
+      stashedOrientationRef.current = null;
       setDragBlockId(null);
       setDragPhase('IDLE');
       setStashedBlockId(null);
       setActiveTargetSlot(null);
       setIsAlignedWithSlot(false);
+
+      const resolvedLayer = Math.max(
+        slot.layer,
+        Math.round((dropPos[1] - BLOCK_HEIGHT / 2) / BLOCK_HEIGHT)
+      );
 
       // Brief settle tick before emitting block:placed with current physical transform
       placementDropTimeoutRef.current = window.setTimeout(() => {
@@ -290,9 +416,11 @@ function TowerPhysicsContent({
           session.blockId,
           {
             position: t ? [t.x, t.y, t.z] : dropPos,
-            quaternion: r ? [r.x, r.y, r.z, r.w] : slot.quaternion,
+            quaternion: r
+              ? [r.x, r.y, r.z, r.w]
+              : [finalQuat.x, finalQuat.y, finalQuat.z, finalQuat.w],
           },
-          slot.layer,
+          resolvedLayer,
           slot.slot
         );
       }, 180);
@@ -301,6 +429,12 @@ function TowerPhysicsContent({
 
     if (session.phase === 'PLACING') {
       // Released outside the top slot: park safely outside & above the tower so user can orbit & finish stacking
+      stashedOrientationRef.current = {
+        blockId: session.blockId,
+        yawSteps: session.yawSteps,
+        isOnSide: session.isOnSide,
+        hasCustomRotation: session.hasCustomRotation,
+      };
       if (body && session.stagePoint) {
         const topY = (validTopSlots[0]?.position[1] ?? 9.25) + 0.85;
         const cur = body.translation();
@@ -327,18 +461,55 @@ function TowerPhysicsContent({
   }, [gl.domElement, onPlaceBlock]);
 
   useEffect(() => {
-    const onWindowPointerUp = () => {
-      if (dragSessionRef.current) {
+    const onWindowPointerUp = (e: PointerEvent) => {
+      if (e.button === 0 && dragSessionRef.current) {
         finishRelease();
       }
     };
+
+    const rotateActiveSession = (mode: 'YAW' | 'SIDE') => {
+      const session = dragSessionRef.current;
+      if (!session || session.phase !== 'PLACING') return;
+      if (mode === 'YAW') {
+        session.yawSteps = (session.yawSteps + 1) % 4;
+      } else {
+        session.isOnSide = !session.isOnSide;
+      }
+      session.hasCustomRotation = true;
+      session.targetQuat.copy(
+        buildPlacementQuaternion(session.yawSteps, session.isOnSide)
+      );
+      soundEngine.playHover(true);
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.key === 'r' || e.key === 'R') {
+        rotateActiveSession('YAW');
+      } else if (e.key === 'f' || e.key === 'F') {
+        rotateActiveSession('SIDE');
+      }
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      if (dragSessionRef.current?.phase === 'PLACING') {
+        e.preventDefault();
+        rotateActiveSession('YAW');
+      }
+    };
+
     window.addEventListener('pointerup', onWindowPointerUp);
     window.addEventListener('pointercancel', onWindowPointerUp);
+    window.addEventListener('keydown', onKeyDown);
+    gl.domElement.addEventListener('contextmenu', onContextMenu);
     return () => {
       window.removeEventListener('pointerup', onWindowPointerUp);
       window.removeEventListener('pointercancel', onWindowPointerUp);
+      window.removeEventListener('keydown', onKeyDown);
+      gl.domElement.removeEventListener('contextmenu', onContextMenu);
     };
-  }, [finishRelease]);
+  }, [finishRelease, gl.domElement]);
 
   const handlePointerOver = useCallback(
     (blockId: number, _e: ThreeEvent<PointerEvent>) => {
@@ -394,6 +565,15 @@ function TowerPhysicsContent({
 
       const initialPhase: DragPhase = isResumingStashed ? 'PLACING' : 'PULLING';
       const initialSlot = validTopSlots[0] ?? null;
+      const savedOrient =
+        isResumingStashed && stashedOrientationRef.current?.blockId === blockId
+          ? stashedOrientationRef.current
+          : null;
+      const defaultYaw = initialSlot ? initialSlot.layer % 2 : 0;
+      const yawSteps = savedOrient ? savedOrient.yawSteps : defaultYaw;
+      const isOnSide = savedOrient ? savedOrient.isOnSide : false;
+      const hasCustomRotation = savedOrient ? savedOrient.hasCustomRotation : false;
+
       const stageRadial = Math.hypot(blockPos.x, blockPos.z);
       const initialStagePoint = isResumingStashed
         ? new THREE.Vector3(
@@ -415,6 +595,10 @@ function TowerPhysicsContent({
         alignedWithSlot: false,
         stagePoint: initialStagePoint,
         freePlacePos: null,
+        yawSteps,
+        isOnSide,
+        hasCustomRotation,
+        targetQuat: buildPlacementQuaternion(yawSteps, isOnSide),
       };
 
       setDragBlockId(blockId);
@@ -540,18 +724,26 @@ function TowerPhysicsContent({
                 session.pullAxis,
                 dirSign * 6.2
               );
+              const targetSlot = validTopSlots[0] ?? null;
               session.phase = 'PLACING';
               session.committed = true;
-              session.targetPlacement = validTopSlots[0] ?? null;
+              session.targetPlacement = targetSlot;
+              session.yawSteps = targetSlot ? targetSlot.layer % 2 : 0;
+              session.isOnSide = false;
+              session.hasCustomRotation = false;
+              session.targetQuat.copy(
+                buildPlacementQuaternion(session.yawSteps, session.isOnSide)
+              );
               setDragPhase('PLACING');
-              setActiveTargetSlot(session.targetPlacement);
+              setActiveTargetSlot(targetSlot);
               soundEngine.stopSlide();
               onGrabBlock(session.blockId, true);
             }
           }
         } else if (session.phase === 'PLACING') {
           const topSlot = validTopSlots[0] ?? session.targetPlacement;
-          const topY = (topSlot?.position[1] ?? 9.25) + 0.65;
+          const baseSlotY = topSlot?.position[1] ?? 9.25;
+          const topY = baseSlotY + 0.65;
           const placePlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -topY);
           const hitPoint = tempVecA;
           const intersected = raycasterRef.current.ray.intersectPlane(placePlane, hitPoint);
@@ -574,6 +766,12 @@ function TowerPhysicsContent({
             if (chosenSlot) {
               session.targetPlacement = chosenSlot;
               setActiveTargetSlot(chosenSlot);
+              if (!session.hasCustomRotation) {
+                session.yawSteps = chosenSlot.layer % 2;
+                session.targetQuat.copy(
+                  buildPlacementQuaternion(session.yawSteps, session.isOnSide)
+                );
+              }
             }
 
             const cur = body.translation();
@@ -582,7 +780,7 @@ function TowerPhysicsContent({
             const radialFromCenter = Math.hypot(hitPoint.x, hitPoint.z);
 
             const aligned = clearedTopHeight
-              ? showGuides
+              ? showGuides && !session.hasCustomRotation
                 ? Boolean(chosenSlot && radialFromCenter < 3.4 && bestDist < 2.25)
                 : Boolean(chosenSlot && radialFromCenter < 3.5)
               : false;
@@ -600,16 +798,50 @@ function TowerPhysicsContent({
               targetZ = session.stagePoint.z;
               targetY = topY + 0.55;
               session.freePlacePos = null;
-            } else if (aligned && chosenSlot && showGuides) {
-              targetX = chosenSlot.position[0];
-              targetZ = chosenSlot.position[2];
-              targetY = chosenSlot.position[1] + 0.24;
-              session.freePlacePos = null;
-            } else if (aligned && chosenSlot && !showGuides) {
-              targetX = THREE.MathUtils.clamp(hitPoint.x, -2.5, 2.5);
-              targetZ = THREE.MathUtils.clamp(hitPoint.z, -2.5, 2.5);
-              targetY = chosenSlot.position[1] + 0.24;
-              session.freePlacePos = [targetX, chosenSlot.position[1] + 0.06, targetZ];
+            } else if (aligned && chosenSlot) {
+              // Gather live boxes of existing upper-layer blocks to avoid any overlap
+              const nearbyBoxes: TopBlockBox[] = [];
+              for (const b of blocks) {
+                if (b.id === session.blockId || b.isRemoved) continue;
+                const otherBody = bodyRefs.current.get(b.id);
+                if (!otherBody) continue;
+                const ot = otherBody.translation();
+                if (ot.y < baseSlotY - BLOCK_HEIGHT * 1.6) continue;
+                const orot = otherBody.rotation();
+                tempQuatB.set(orot.x, orot.y, orot.z, orot.w);
+                const ext = getWorldHalfExtents(tempQuatB);
+                nearbyBoxes.push({
+                  x: ot.x,
+                  y: ot.y,
+                  z: ot.z,
+                  hx: ext.hx,
+                  hy: ext.hy,
+                  hz: ext.hz,
+                });
+              }
+
+              const desiredX =
+                showGuides && !session.hasCustomRotation
+                  ? chosenSlot.position[0]
+                  : THREE.MathUtils.clamp(hitPoint.x, -2.3, 2.3);
+              const desiredZ =
+                showGuides && !session.hasCustomRotation
+                  ? chosenSlot.position[2]
+                  : THREE.MathUtils.clamp(hitPoint.z, -2.3, 2.3);
+
+              const resolved = resolveNonOverlappingPlacement(
+                desiredX,
+                desiredZ,
+                session.targetQuat,
+                chosenSlot.position[1],
+                nearbyBoxes,
+                true
+              );
+
+              targetX = resolved.x;
+              targetZ = resolved.z;
+              targetY = resolved.y + 0.14;
+              session.freePlacePos = [resolved.x, resolved.y, resolved.z];
             } else {
               targetX = THREE.MathUtils.clamp(hitPoint.x, -9, 9);
               targetZ = THREE.MathUtils.clamp(hitPoint.z, -9, 9);
@@ -627,17 +859,7 @@ function TowerPhysicsContent({
 
             const curRot = body.rotation();
             tempQuatA.set(curRot.x, curRot.y, curRot.z, curRot.w);
-            if (chosenSlot) {
-              tempQuatB.set(
-                chosenSlot.quaternion[0],
-                chosenSlot.quaternion[1],
-                chosenSlot.quaternion[2],
-                chosenSlot.quaternion[3]
-              );
-            } else {
-              tempQuatB.copy(tempQuatA);
-            }
-            tempQuatA.slerp(tempQuatB, smoothFactor);
+            tempQuatA.slerp(session.targetQuat, smoothFactor);
             body.setNextKinematicRotation({
               x: tempQuatA.x,
               y: tempQuatA.y,
@@ -668,11 +890,14 @@ function TowerPhysicsContent({
           break;
         }
 
-        // Check severe block tilt (> ~55 deg) indicating structural collapse onto table/side
+        // Check severe longitudinal tilt (> ~42 deg from horizontal) indicating structural collapse;
+        // keeps blocks intentionally placed sideways on their narrow edge valid.
         const r = body.rotation();
         tempQuatA.set(r.x, r.y, r.z, r.w);
-        const upY = tempVecB.set(0, 1, 0).applyQuaternion(tempQuatA).y;
-        if (upY < 0.52) {
+        const longAxisY = Math.abs(
+          tempVecB.set(0, 0, 1).applyQuaternion(tempQuatA).y
+        );
+        if (longAxisY > 0.67) {
           triggerCollapseOnce();
           break;
         }

@@ -2,8 +2,10 @@ import { createClient, RealtimeChannel, SupabaseClient } from '@supabase/supabas
 import { customAlphabet, nanoid } from 'nanoid';
 import {
   ChatMessage,
+  cloneBlocks,
   CompactBlockTuple,
   createInitialBlocks,
+  GameRulesMode,
   getValidTopPlacements,
   isBlockSelectable,
   Player,
@@ -257,6 +259,15 @@ class SupabaseRoomController {
     }
     const timedOutPlayer = this.roomState.players[this.roomState.currentTurnIndex];
     const loserId = timedOutPlayer?.id ?? null;
+
+    if (this.roomState.rulesMode === 'ELIMINATION' && loserId) {
+      await this.eliminatePlayerAndRestore(
+        loserId,
+        `${timedOutPlayer?.name ?? 'Active player'} ran out of time and was ELIMINATED!`
+      );
+      return;
+    }
+
     const nextState = this.buildEndedState(this.roomState, loserId, 'TIMEOUT');
     await this.commitAndBroadcastState(nextState);
     await this.broadcastSystemChat(
@@ -279,18 +290,94 @@ class SupabaseRoomController {
       settlingStartedAt: null,
       turnStartedAt: Date.now(),
       currentTurnIndex: nextTurnIndex,
+      lastStableBlocks: cloneBlocks(this.roomState.blocks),
     };
     await this.commitAndBroadcastState(nextState);
   }
 
-  private findNextConnectedPlayerIndex(state: RoomState, fromIndex: number): number {
-    const count = state.players.length;
+  private findNextConnectedPlayerIndex(
+    state: RoomState,
+    fromIndex: number,
+    playersOverride?: Player[]
+  ): number {
+    const list = playersOverride ?? state.players;
+    const count = list.length;
     if (count === 0) return 0;
     for (let offset = 1; offset <= count; offset++) {
       const idx = (fromIndex + offset) % count;
-      if (state.players[idx]?.connected) return idx;
+      if (list[idx]?.connected && !list[idx]?.eliminated) return idx;
+    }
+    for (let offset = 1; offset <= count; offset++) {
+      const idx = (fromIndex + offset) % count;
+      if (!list[idx]?.eliminated) return idx;
     }
     return (fromIndex + 1) % count;
+  }
+
+  private async eliminatePlayerAndRestore(
+    loserId: string,
+    reasonMessage: string
+  ): Promise<void> {
+    if (!this.roomState) return;
+    const updatedPlayers = this.roomState.players.map((p) =>
+      p.id === loserId ? { ...p, eliminated: true } : p
+    );
+    const alivePlayers = updatedPlayers.filter((p) => !p.eliminated && p.connected);
+    const now = Date.now();
+
+    if (alivePlayers.length <= 1) {
+      const winner = alivePlayers[0] ?? updatedPlayers.find((p) => !p.eliminated) ?? null;
+      const ended: RoomState = {
+        ...this.roomState,
+        status: 'GAME_OVER',
+        players: updatedPlayers,
+        settlingStartedAt: null,
+        activeBlockId: null,
+        lastEliminatedPlayerId: loserId,
+        lastEliminatedAt: now,
+        loserId,
+        winnerId: winner?.id ?? null,
+        gameOverReason: 'TOWER_COLLAPSED',
+      };
+      await this.commitAndBroadcastState(ended);
+      await this.broadcastSystemChat(
+        `${reasonMessage} ${winner ? `${winner.name} is the last survivor!` : ''}`,
+        '💥'
+      );
+      return;
+    }
+
+    const restoredBlocks = cloneBlocks(
+      this.roomState.lastStableBlocks.length > 0
+        ? this.roomState.lastStableBlocks
+        : createInitialBlocks()
+    );
+    const nextTurnIndex = this.findNextConnectedPlayerIndex(
+      this.roomState,
+      this.roomState.currentTurnIndex,
+      updatedPlayers
+    );
+
+    const restoredState: RoomState = {
+      ...this.roomState,
+      status: 'PLAYING',
+      players: updatedPlayers,
+      currentTurnIndex: nextTurnIndex,
+      turnStartedAt: now,
+      settlingStartedAt: null,
+      activeBlockId: null,
+      blocks: restoredBlocks,
+      lastStableBlocks: cloneBlocks(restoredBlocks),
+      towerRestoreVersion: (this.roomState.towerRestoreVersion ?? 1) + 1,
+      lastEliminatedPlayerId: loserId,
+      lastEliminatedAt: now,
+    };
+
+    await this.commitAndBroadcastState(restoredState);
+    await this.broadcastSystemChat(
+      `${reasonMessage} Tower restored (${alivePlayers.length} players left)!`,
+      '💥'
+    );
   }
 
   private buildEndedState(
@@ -392,7 +479,19 @@ class SupabaseRoomController {
       })
       .on('broadcast', { event: 'physics:state' }, ({ payload }) => {
         if (Array.isArray(payload)) {
-          this.callbacks?.onPhysicsState(payload as CompactBlockTuple[]);
+          const compact = payload as CompactBlockTuple[];
+          if (this.roomState) {
+            for (const tuple of compact) {
+              if (!Array.isArray(tuple) || tuple.length < 8) continue;
+              const [id, x, y, z, qx, qy, qz, qw] = tuple;
+              const block = this.roomState.blocks[id];
+              if (block && block.id === id) {
+                block.position = [x, y, z];
+                block.quaternion = [qx, qy, qz, qw];
+              }
+            }
+          }
+          this.callbacks?.onPhysicsState(compact);
         }
       })
       .on('broadcast', { event: 'block:hovered' }, ({ payload }) => {
@@ -465,6 +564,8 @@ class SupabaseRoomController {
   }
 
   private shouldAdoptDbState(local: RoomState, incoming: RoomState): boolean {
+    if ((incoming.towerRestoreVersion ?? 1) > (local.towerRestoreVersion ?? 1)) return true;
+    if (incoming.rulesMode !== local.rulesMode) return true;
     if (incoming.blocksMovedCount > local.blocksMovedCount) return true;
     if (incoming.status !== local.status) return true;
     if (incoming.players.length !== local.players.length) return true;
@@ -605,17 +706,20 @@ class SupabaseRoomController {
       roomId = generateRoomCode();
     }
 
+    const initialBlocks = createInitialBlocks();
     const hostPlayer: Player = {
       id: this.clientId,
       name: sanitizePlayerName(rawPlayerName),
       score: 0,
       isHost: true,
       connected: true,
+      eliminated: false,
     };
 
     const initialState: RoomState = {
       roomId,
       status: 'WAITING',
+      rulesMode: 'CLASSIC',
       players: [hostPlayer],
       currentTurnIndex: 0,
       startingPlayerIndex: 0,
@@ -625,7 +729,11 @@ class SupabaseRoomController {
       settlingDurationMs: SETTLING_DURATION_MS,
       activeBlockId: null,
       blocksMovedCount: 0,
-      blocks: createInitialBlocks(),
+      blocks: initialBlocks,
+      lastStableBlocks: cloneBlocks(initialBlocks),
+      towerRestoreVersion: 1,
+      lastEliminatedPlayerId: null,
+      lastEliminatedAt: null,
       winnerId: null,
       loserId: null,
       gameOverReason: null,
@@ -748,6 +856,17 @@ class SupabaseRoomController {
     }
   }
 
+  public async setRulesMode(rulesMode: GameRulesMode): Promise<void> {
+    if (!this.roomState || this.roomState.status !== 'WAITING') return;
+    const me = this.roomState.players.find((p) => p.id === this.clientId);
+    if (!me?.isHost) return;
+    const nextState: RoomState = {
+      ...this.roomState,
+      rulesMode,
+    };
+    await this.commitAndBroadcastState(nextState);
+  }
+
   public async startGame(): Promise<void> {
     if (!this.roomState) return;
     const me = this.roomState.players.find((p) => p.id === this.clientId);
@@ -757,6 +876,7 @@ class SupabaseRoomController {
     }
     if (this.roomState.status !== 'WAITING') return;
 
+    const freshBlocks = createInitialBlocks();
     const nextState: RoomState = {
       ...this.roomState,
       status: 'PLAYING',
@@ -766,14 +886,28 @@ class SupabaseRoomController {
       settlingStartedAt: null,
       activeBlockId: null,
       blocksMovedCount: 0,
+      players: this.roomState.players.map((p) => ({
+        ...p,
+        score: 0,
+        eliminated: false,
+      })),
       winnerId: null,
       loserId: null,
       gameOverReason: null,
-      blocks: createInitialBlocks(),
+      blocks: freshBlocks,
+      lastStableBlocks: cloneBlocks(freshBlocks),
+      towerRestoreVersion: 1,
+      lastEliminatedPlayerId: null,
+      lastEliminatedAt: null,
     };
 
     await this.commitAndBroadcastState(nextState);
-    await this.broadcastSystemChat('Match started! Pull any block below the top layer.', '🎯');
+    await this.broadcastSystemChat(
+      nextState.rulesMode === 'ELIMINATION'
+        ? 'Elimination Tower started! Last builder standing wins!'
+        : 'Match started! Pull any block below the top layer.',
+      nextState.rulesMode === 'ELIMINATION' ? '💥' : '🎯'
+    );
   }
 
   public hoverBlock(blockId: number | null): void {
@@ -896,6 +1030,15 @@ class SupabaseRoomController {
 
     const active = this.roomState.players[this.roomState.currentTurnIndex];
     const loserId = active?.id ?? null;
+
+    if (this.roomState.rulesMode === 'ELIMINATION' && loserId) {
+      await this.eliminatePlayerAndRestore(
+        loserId,
+        `${active?.name ?? 'A player'} toppled the tower and was ELIMINATED!`
+      );
+      return;
+    }
+
     const ended = this.buildEndedState(this.roomState, loserId, 'TOWER_COLLAPSED');
 
     await this.commitAndBroadcastState(ended);
@@ -907,10 +1050,17 @@ class SupabaseRoomController {
 
   public async rematch(): Promise<void> {
     if (!this.roomState) return;
+    const resetPlayers = this.roomState.players.map((p) => ({
+      ...p,
+      score: 0,
+      eliminated: false,
+    }));
     const nextStarter = this.findNextConnectedPlayerIndex(
       this.roomState,
-      this.roomState.startingPlayerIndex
+      this.roomState.startingPlayerIndex,
+      resetPlayers
     );
+    const freshBlocks = createInitialBlocks();
 
     const nextState: RoomState = {
       ...this.roomState,
@@ -921,8 +1071,12 @@ class SupabaseRoomController {
       settlingStartedAt: null,
       activeBlockId: null,
       blocksMovedCount: 0,
-      players: this.roomState.players.map((p) => ({ ...p, score: 0 })),
-      blocks: createInitialBlocks(),
+      players: resetPlayers,
+      blocks: freshBlocks,
+      lastStableBlocks: cloneBlocks(freshBlocks),
+      towerRestoreVersion: (this.roomState.towerRestoreVersion ?? 1) + 1,
+      lastEliminatedPlayerId: null,
+      lastEliminatedAt: null,
       winnerId: null,
       loserId: null,
       gameOverReason: null,

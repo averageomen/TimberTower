@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  ArrowUpCircle,
   Check,
   Copy,
   Crown,
+  Download,
+  Flame,
   Gamepad2,
   Link2,
   Play,
   Plus,
+  RefreshCw,
   Server,
   Sparkles,
   Trash2,
@@ -14,7 +18,15 @@ import {
   Wifi,
 } from 'lucide-react';
 import { SupabaseConfig } from '../network/supabaseClient';
-import { RoomState } from '../types';
+import { GameRulesMode, RoomState } from '../types';
+import {
+  APP_VERSION,
+  AppUpdateInfo,
+  checkForAppUpdate,
+  getCurrentAppVersion,
+  startAppSelfUpdate,
+  subscribeUpdateEvents,
+} from '../utils/updater';
 
 export async function copyToClipboard(text: string): Promise<boolean> {
   if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
@@ -61,10 +73,11 @@ interface LobbyProps {
   initialRoomCode: string;
   errorMessage: string | null;
   onSaveSupabaseConfig: (url: string, anonKey: string) => void;
+  onSetOnlineRulesMode: (rulesMode: GameRulesMode) => void;
   onCreateOnlineRoom: (playerName: string) => void;
   onJoinOnlineRoom: (roomId: string, playerName: string) => void;
   onStartOnlineGame: () => void;
-  onStartLocalGame: (playerNames: string[]) => void;
+  onStartLocalGame: (playerNames: string[], rulesMode: GameRulesMode) => void;
   onLeaveOnlineRoom: () => void;
   onClearError: () => void;
 }
@@ -77,6 +90,7 @@ export function Lobby({
   initialRoomCode,
   errorMessage,
   onSaveSupabaseConfig,
+  onSetOnlineRulesMode,
   onCreateOnlineRoom,
   onJoinOnlineRoom,
   onStartOnlineGame,
@@ -90,15 +104,64 @@ export function Lobby({
   const [urlDraft, setUrlDraft] = useState(supabaseConfig.url);
   const [keyDraft, setKeyDraft] = useState(supabaseConfig.anonKey);
   const [showServerConfig, setShowServerConfig] = useState(false);
+  const [localRulesMode, setLocalRulesMode] = useState<GameRulesMode>('CLASSIC');
   const [localPlayers, setLocalPlayers] = useState<string[]>(['Player 1', 'Player 2']);
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [copyFallbackHint, setCopyFallbackHint] = useState(false);
+  const [appVersion, setAppVersion] = useState(APP_VERSION);
+  const [checkingUpdate, setCheckingUpdate] = useState(true);
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [updatingNow, setUpdatingNow] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateError, setUpdateError] = useState<string | null>(null);
   const inviteInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setUrlDraft(supabaseConfig.url);
     setKeyDraft(supabaseConfig.anonKey);
   }, [supabaseConfig.url, supabaseConfig.anonKey]);
+
+  useEffect(() => {
+    let active = true;
+    void getCurrentAppVersion().then((v) => {
+      if (active) setAppVersion(v);
+    });
+    void checkForAppUpdate().then((info) => {
+      if (!active) return;
+      setUpdateInfo(info);
+      setCheckingUpdate(false);
+    });
+
+    const unsub = subscribeUpdateEvents(
+      (pct) => {
+        if (active) setUpdateProgress(pct);
+      },
+      (msg) => {
+        if (active) {
+          setUpdatingNow(false);
+          setUpdateError(msg);
+        }
+      }
+    );
+
+    return () => {
+      active = false;
+      unsub();
+    };
+  }, []);
+
+  const handleStartUpdate = async () => {
+    if (!updateInfo?.downloadUrl) return;
+    setUpdateError(null);
+    setUpdatingNow(true);
+    setUpdateProgress(0);
+    try {
+      await startAppSelfUpdate(updateInfo.downloadUrl);
+    } catch (err) {
+      setUpdatingNow(false);
+      setUpdateError(err instanceof Error ? err.message : 'Update failed.');
+    }
+  };
 
   const isHost = Boolean(
     roomState && mySocketId && roomState.players.find((p) => p.id === mySocketId)?.isHost
@@ -129,8 +192,19 @@ export function Lobby({
   };
 
   const handleAddLocalPlayer = () => {
-    if (localPlayers.length >= 4) return;
+    if (localPlayers.length >= 6) return;
     setLocalPlayers([...localPlayers, `Player ${localPlayers.length + 1}`]);
+  };
+
+  const handleSelectLocalRulesMode = (nextMode: GameRulesMode) => {
+    setLocalRulesMode(nextMode);
+    if (nextMode === 'ELIMINATION' && localPlayers.length < 3) {
+      const next = [...localPlayers];
+      while (next.length < 3) {
+        next.push(`Player ${next.length + 1}`);
+      }
+      setLocalPlayers(next);
+    }
   };
 
   const handleRemoveLocalPlayer = (index: number) => {
@@ -149,9 +223,14 @@ export function Lobby({
                 <Sparkles className="h-5 w-5" />
               </div>
               <div>
-                <h1 className="text-xl font-bold tracking-tight text-amber-50">
-                  TIMBER STACK
-                </h1>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-xl font-bold tracking-tight text-amber-50">
+                    TIMBER STACK
+                  </h1>
+                  <span className="rounded-md bg-stone-800 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-amber-300/90">
+                    v{appVersion}
+                  </span>
+                </div>
                 <p className="text-xs text-amber-200/70">
                   3D Physics Multiplayer Jenga
                 </p>
@@ -178,6 +257,72 @@ export function Lobby({
         </div>
 
         <div className="p-6">
+          {updateInfo?.updateAvailable ? (
+            <div className="space-y-4">
+              <div className="rounded-2xl border border-amber-400/40 bg-gradient-to-br from-amber-950/60 to-stone-950/90 p-5 text-center">
+                <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40">
+                  <ArrowUpCircle className="h-6 w-6" />
+                </div>
+                <h2 className="text-lg font-bold text-amber-50">
+                  New Update Available (v{updateInfo.latestVersion})
+                </h2>
+                <p className="mt-1 text-xs text-stone-300">
+                  Installed: <span className="font-mono text-stone-400">v{updateInfo.currentVersion}</span>
+                  {' → '}
+                  Latest: <span className="font-mono font-semibold text-emerald-300">v{updateInfo.latestVersion}</span>
+                </p>
+                <p className="mt-2 text-xs text-amber-200/80">
+                  Update to play with the newest features and stay compatible with your friends.
+                </p>
+
+                {updateError && (
+                  <div className="mt-3 rounded-xl border border-red-500/40 bg-red-950/70 px-3 py-2 text-xs text-red-200">
+                    {updateError}
+                  </div>
+                )}
+
+                {updatingNow ? (
+                  <div className="mt-4 space-y-2">
+                    <div className="flex items-center justify-between text-xs font-semibold text-amber-200">
+                      <span className="flex items-center gap-1.5">
+                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                        {updateProgress >= 100
+                          ? 'Installing & restarting...'
+                          : 'Downloading update...'}
+                      </span>
+                      <span className="font-mono">{updateProgress}%</span>
+                    </div>
+                    <div className="h-2 w-full overflow-hidden rounded-full bg-stone-800">
+                      <div
+                        className="h-full rounded-full bg-gradient-to-r from-amber-400 to-emerald-400 transition-all duration-150"
+                        style={{ width: `${updateProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleStartUpdate}
+                    className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-400 to-amber-400 px-5 py-3 text-sm font-bold text-stone-950 shadow-lg shadow-emerald-500/20 transition hover:brightness-110"
+                  >
+                    <Download className="h-4 w-4" />
+                    Update to v{updateInfo.latestVersion}
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : checkingUpdate ? (
+            <div className="flex flex-col items-center justify-center py-10 text-center">
+              <RefreshCw className="h-7 w-7 animate-spin text-amber-400" />
+              <div className="mt-3 text-sm font-semibold text-stone-200">
+                Checking for updates...
+              </div>
+              <div className="mt-1 text-xs text-stone-400">
+                Installed version v{appVersion}
+              </div>
+            </div>
+          ) : (
+            <>
           {(showServerConfig || (!supabaseConfig.isConfigured && tab === 'ONLINE' && !roomState)) && (
             <div className="mb-4 space-y-2.5 rounded-xl border border-stone-700/80 bg-stone-950/75 p-3.5">
               <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-stone-400">
@@ -287,6 +432,43 @@ export function Lobby({
                       Clipboard access blocked — link selected above, press Ctrl+C to copy.
                     </div>
                   )}
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-stone-400">
+                  Game Mode
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    disabled={!isHost}
+                    onClick={() => onSetOnlineRulesMode('CLASSIC')}
+                    className={`rounded-xl border px-3 py-2 text-left text-xs transition ${
+                      roomState.rulesMode === 'CLASSIC'
+                        ? 'border-amber-400/70 bg-amber-500/20 text-amber-100'
+                        : 'border-stone-800 bg-stone-950/60 text-stone-400 hover:text-stone-200'
+                    } ${!isHost ? 'cursor-default' : ''}`}
+                  >
+                    <div className="font-bold">Classic Jenga</div>
+                    <div className="text-[11px] opacity-75">First collapse ends round</div>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!isHost}
+                    onClick={() => onSetOnlineRulesMode('ELIMINATION')}
+                    className={`rounded-xl border px-3 py-2 text-left text-xs transition ${
+                      roomState.rulesMode === 'ELIMINATION'
+                        ? 'border-orange-400/80 bg-orange-500/20 text-orange-100'
+                        : 'border-stone-800 bg-stone-950/60 text-stone-400 hover:text-stone-200'
+                    } ${!isHost ? 'cursor-default' : ''}`}
+                  >
+                    <div className="flex items-center gap-1 font-bold">
+                      <Flame className="h-3.5 w-3.5 text-orange-400" />
+                      Elimination Tower
+                    </div>
+                    <div className="text-[11px] opacity-75">Last builder standing wins</div>
+                  </button>
                 </div>
               </div>
 
@@ -456,13 +638,44 @@ export function Lobby({
                 </div>
               ) : (
                 <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectLocalRulesMode('CLASSIC')}
+                      className={`rounded-xl border px-3 py-2 text-left text-xs transition ${
+                        localRulesMode === 'CLASSIC'
+                          ? 'border-amber-400/70 bg-amber-500/20 text-amber-100'
+                          : 'border-stone-800 bg-stone-950/60 text-stone-400 hover:text-stone-200'
+                      }`}
+                    >
+                      <div className="font-bold">Classic Jenga</div>
+                      <div className="text-[11px] opacity-75">First collapse ends round</div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSelectLocalRulesMode('ELIMINATION')}
+                      className={`rounded-xl border px-3 py-2 text-left text-xs transition ${
+                        localRulesMode === 'ELIMINATION'
+                          ? 'border-orange-400/80 bg-orange-500/20 text-orange-100'
+                          : 'border-stone-800 bg-stone-950/60 text-stone-400 hover:text-stone-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1 font-bold">
+                        <Flame className="h-3.5 w-3.5 text-orange-400" />
+                        Elimination Tower
+                      </div>
+                      <div className="text-[11px] opacity-75">Reset tower, eliminate 1</div>
+                    </button>
+                  </div>
+
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold uppercase tracking-wider text-stone-400">
-                      Local Players ({localPlayers.length}/4)
+                      Local Players ({localPlayers.length}/6)
                     </span>
                     <button
+                      type="button"
                       onClick={handleAddLocalPlayer}
-                      disabled={localPlayers.length >= 4}
+                      disabled={localPlayers.length >= 6}
                       className="flex items-center gap-1 rounded-lg bg-stone-800 px-2.5 py-1 text-xs font-medium text-amber-300 transition hover:bg-stone-700 disabled:opacity-40"
                     >
                       <Plus className="h-3.5 w-3.5" />
@@ -470,7 +683,7 @@ export function Lobby({
                     </button>
                   </div>
 
-                  <div className="space-y-2">
+                  <div className="max-h-40 space-y-2 overflow-y-auto pr-1 jenga-scroll">
                     {localPlayers.map((name, idx) => (
                       <div key={idx} className="flex items-center gap-2">
                         <input
@@ -486,6 +699,7 @@ export function Lobby({
                         />
                         {localPlayers.length > 1 && (
                           <button
+                            type="button"
                             onClick={() => handleRemoveLocalPlayer(idx)}
                             className="rounded-xl border border-stone-800 bg-stone-950 p-2 text-stone-400 hover:text-red-300"
                             title="Remove player"
@@ -498,15 +712,21 @@ export function Lobby({
                   </div>
 
                   <button
+                    type="button"
                     onClick={() =>
                       onStartLocalGame(
-                        localPlayers.map((n, i) => n.trim() || `Player ${i + 1}`)
+                        localPlayers.map((n, i) => n.trim() || `Player ${i + 1}`),
+                        localRulesMode
                       )
                     }
                     className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-4 py-3 text-sm font-bold text-stone-950 shadow-lg shadow-amber-500/20 transition hover:brightness-110"
                   >
                     <Play className="h-4 w-4 fill-current" />
-                    {localPlayers.length === 1 ? 'Start Solo Practice' : 'Start Pass-and-Play'}
+                    {localRulesMode === 'ELIMINATION'
+                      ? 'Start Elimination Tower'
+                      : localPlayers.length === 1
+                        ? 'Start Solo Practice'
+                        : 'Start Pass-and-Play'}
                   </button>
                 </div>
               )}
@@ -518,6 +738,8 @@ export function Lobby({
                 and hold steady for 3 seconds. Drag empty space to orbit the camera.
               </div>
             </div>
+          )}
+            </>
           )}
         </div>
       </div>
