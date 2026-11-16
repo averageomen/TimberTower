@@ -1,0 +1,742 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Html, OrbitControls, RoundedBox } from '@react-three/drei';
+import { ThreeEvent, useFrame, useThree } from '@react-three/fiber';
+import { CollisionEnterPayload, Physics, RapierRigidBody } from '@react-three/rapier';
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
+import * as THREE from 'three';
+import { soundEngine } from '../audio/soundEngine';
+import {
+  BLOCK_HEIGHT,
+  BLOCK_LENGTH,
+  BLOCK_WIDTH,
+  BlockState,
+  CompactBlockTuple,
+  getValidTopPlacements,
+  isBlockSelectable,
+  PlacementSlot,
+  Quat,
+  RoomStatus,
+  Vec3,
+} from '../types';
+import { JengaBlock } from './JengaBlock';
+import { EnvironmentScene } from './EnvironmentScene';
+
+interface JengaTowerProps {
+  blocks: BlockState[];
+  status: RoomStatus;
+  isMyTurn: boolean;
+  activeBlockId: number | null;
+  remoteHoveredBlockId: number | null;
+  remoteGrabbedBlockId: number | null;
+  remotePhysicsFrames: React.MutableRefObject<Map<number, { pos: THREE.Vector3; quat: THREE.Quaternion }>>;
+  matchResetVersion: number;
+  cameraResetTrigger: number;
+  onHoverBlock: (blockId: number | null) => void;
+  onGrabBlock: (blockId: number, committed: boolean) => void;
+  onPlaceBlock: (
+    blockId: number,
+    finalTransform: { position: Vec3; quaternion: Quat },
+    targetLayer: number,
+    targetSlot: number
+  ) => void;
+  onPhysicsSync: (compactBlocks: CompactBlockTuple[]) => void;
+  onCollapse: () => void;
+}
+
+type DragPhase = 'IDLE' | 'PULLING' | 'PLACING';
+
+interface DragSession {
+  blockId: number;
+  phase: DragPhase;
+  startBlockPos: THREE.Vector3;
+  startHitPoint: THREE.Vector3;
+  pullAxis: THREE.Vector3;
+  dragPlane: THREE.Plane;
+  committed: boolean;
+  targetPlacement: PlacementSlot | null;
+  alignedWithSlot: boolean;
+}
+
+function GhostPlacementGuides({
+  slots,
+  activeSlot,
+  isAligned,
+}: {
+  slots: PlacementSlot[];
+  activeSlot: PlacementSlot | null;
+  isAligned: boolean;
+}) {
+  return (
+    <group>
+      {slots.map((slot) => {
+        const isCurrent =
+          activeSlot?.layer === slot.layer && activeSlot?.slot === slot.slot;
+        const color = isCurrent && isAligned ? '#34d399' : '#fbbf24';
+        const opacity = isCurrent ? (isAligned ? 0.55 : 0.34) : 0.16;
+
+        return (
+          <group
+            key={`${slot.layer}-${slot.slot}`}
+            position={slot.position}
+            quaternion={slot.quaternion}
+          >
+            <RoundedBox args={[BLOCK_WIDTH, BLOCK_HEIGHT, BLOCK_LENGTH]} radius={0.04} smoothness={2}>
+              <meshStandardMaterial
+                color={color}
+                emissive={color}
+                emissiveIntensity={isCurrent && isAligned ? 0.65 : 0.25}
+                transparent
+                opacity={opacity}
+                depthWrite={false}
+              />
+            </RoundedBox>
+            {isCurrent && (
+              <Html position={[0, 0.65, 0]} center distanceFactor={14} zIndexRange={[15, 0]}>
+                <div
+                  className={`pointer-events-none whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold shadow-md backdrop-blur ${
+                    isAligned
+                      ? 'border border-emerald-400/70 bg-emerald-950/90 text-emerald-100'
+                      : 'border border-amber-400/60 bg-stone-900/90 text-amber-200'
+                  }`}
+                >
+                  {isAligned ? 'Release to Place' : 'Drag Here to Stack'}
+                </div>
+              </Html>
+            )}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
+function TowerPhysicsContent({
+  blocks,
+  status,
+  isMyTurn,
+  activeBlockId,
+  remoteHoveredBlockId,
+  remoteGrabbedBlockId,
+  remotePhysicsFrames,
+  matchResetVersion,
+  cameraResetTrigger,
+  onHoverBlock,
+  onGrabBlock,
+  onPlaceBlock,
+  onPhysicsSync,
+  onCollapse,
+}: JengaTowerProps) {
+  const { camera, pointer, gl } = useThree();
+  const controlsRef = useRef<OrbitControlsImpl | null>(null);
+  const bodyRefs = useRef<Map<number, RapierRigidBody>>(new Map());
+
+  const [orbitEnabled, setOrbitEnabled] = useState(true);
+  const [hoveredBlockId, setHoveredBlockId] = useState<number | null>(null);
+  const [dragBlockId, setDragBlockId] = useState<number | null>(null);
+  const [dragPhase, setDragPhase] = useState<DragPhase>('IDLE');
+  const [stashedBlockId, setStashedBlockId] = useState<number | null>(null);
+  const [activeTargetSlot, setActiveTargetSlot] = useState<PlacementSlot | null>(null);
+  const [isAlignedWithSlot, setIsAlignedWithSlot] = useState(false);
+
+  const dragSessionRef = useRef<DragSession | null>(null);
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const collapseReportedRef = useRef(false);
+  const spawnProtectionUntilRef = useRef(performance.now() + 900);
+  const lastSyncSentAtRef = useRef(0);
+  const prevDynamicRef = useRef(false);
+  const placementDropTimeoutRef = useRef<number | null>(null);
+
+  const tempVecA = useMemo(() => new THREE.Vector3(), []);
+  const tempVecB = useMemo(() => new THREE.Vector3(), []);
+  const tempQuatA = useMemo(() => new THREE.Quaternion(), []);
+  const tempQuatB = useMemo(() => new THREE.Quaternion(), []);
+  const defaultTarget = useMemo<[number, number, number]>(() => [0, 4.5, 0], []);
+
+  const isLocalSimulator = isMyTurn && (status === 'PLAYING' || status === 'SETTLING');
+
+  const validTopSlots = useMemo(
+    () =>
+      getValidTopPlacements(
+        blocks,
+        dragBlockId ?? stashedBlockId ?? activeBlockId
+      ),
+    [blocks, dragBlockId, stashedBlockId, activeBlockId]
+  );
+
+  useEffect(() => {
+    collapseReportedRef.current = false;
+    spawnProtectionUntilRef.current = performance.now() + 1000;
+    dragSessionRef.current = null;
+    setDragBlockId(null);
+    setDragPhase('IDLE');
+    setStashedBlockId(null);
+    setActiveTargetSlot(null);
+    setIsAlignedWithSlot(false);
+    setOrbitEnabled(true);
+    soundEngine.stopSlide();
+
+    if (placementDropTimeoutRef.current !== null) {
+      window.clearTimeout(placementDropTimeoutRef.current);
+      placementDropTimeoutRef.current = null;
+    }
+  }, [matchResetVersion]);
+
+  useEffect(() => {
+    if (cameraResetTrigger === 0 || !controlsRef.current) return;
+    camera.position.set(11.5, 10.5, 11.5);
+    controlsRef.current.target.set(0, 4.5, 0);
+    controlsRef.current.update();
+  }, [camera, cameraResetTrigger]);
+
+  // Sync rigid bodies when switching turn ownership into local dynamic simulation
+  useEffect(() => {
+    if (isLocalSimulator && !prevDynamicRef.current) {
+      for (const block of blocks) {
+        const body = bodyRefs.current.get(block.id);
+        if (!body) continue;
+        const remote = remotePhysicsFrames.current.get(block.id);
+        const pos = remote
+          ? { x: remote.pos.x, y: remote.pos.y, z: remote.pos.z }
+          : { x: block.position[0], y: block.position[1], z: block.position[2] };
+        const quat = remote
+          ? { x: remote.quat.x, y: remote.quat.y, z: remote.quat.z, w: remote.quat.w }
+          : {
+              x: block.quaternion[0],
+              y: block.quaternion[1],
+              z: block.quaternion[2],
+              w: block.quaternion[3],
+            };
+        body.setTranslation(pos, true);
+        body.setRotation(quat, true);
+        body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      }
+      spawnProtectionUntilRef.current = performance.now() + 450;
+    }
+    prevDynamicRef.current = isLocalSimulator;
+  }, [isLocalSimulator, blocks, remotePhysicsFrames]);
+
+  const registerBody = useCallback((blockId: number, body: RapierRigidBody | null) => {
+    if (body) {
+      bodyRefs.current.set(blockId, body);
+    } else {
+      bodyRefs.current.delete(blockId);
+    }
+  }, []);
+
+  const canInteractBlock = useCallback(
+    (blockId: number) => {
+      if (!isMyTurn || status !== 'PLAYING') return false;
+      if (activeBlockId !== null && activeBlockId !== blockId) return false;
+      return isBlockSelectable(blocks, blockId);
+    },
+    [isMyTurn, status, activeBlockId, blocks]
+  );
+
+  const triggerCollapseOnce = useCallback(() => {
+    if (collapseReportedRef.current) return;
+    if (status !== 'PLAYING' && status !== 'SETTLING') return;
+    collapseReportedRef.current = true;
+    soundEngine.playCollapse();
+    onCollapse();
+  }, [status, onCollapse]);
+
+  const finishRelease = useCallback(() => {
+    const session = dragSessionRef.current;
+    if (!session) return;
+
+    const body = bodyRefs.current.get(session.blockId);
+    dragSessionRef.current = null;
+    setOrbitEnabled(true);
+    soundEngine.stopSlide();
+    gl.domElement.style.cursor = 'auto';
+
+    if (session.phase === 'PLACING' && session.targetPlacement && session.alignedWithSlot && body) {
+      const slot = session.targetPlacement;
+      const dropPos: Vec3 = [slot.position[0], slot.position[1] + 0.06, slot.position[2]];
+      body.setTranslation({ x: dropPos[0], y: dropPos[1], z: dropPos[2] }, true);
+      body.setRotation(
+        {
+          x: slot.quaternion[0],
+          y: slot.quaternion[1],
+          z: slot.quaternion[2],
+          w: slot.quaternion[3],
+        },
+        true
+      );
+      body.wakeUp();
+
+      soundEngine.playPlace();
+      setDragBlockId(null);
+      setDragPhase('IDLE');
+      setStashedBlockId(null);
+      setActiveTargetSlot(null);
+      setIsAlignedWithSlot(false);
+
+      // Brief settle tick before emitting block:placed with current physical transform
+      placementDropTimeoutRef.current = window.setTimeout(() => {
+        const settledBody = bodyRefs.current.get(session.blockId);
+        const t = settledBody?.translation();
+        const r = settledBody?.rotation();
+        onPlaceBlock(
+          session.blockId,
+          {
+            position: t ? [t.x, t.y, t.z] : slot.position,
+            quaternion: r ? [r.x, r.y, r.z, r.w] : slot.quaternion,
+          },
+          slot.layer,
+          slot.slot
+        );
+      }, 180);
+      return;
+    }
+
+    if (session.phase === 'PLACING') {
+      // Released outside the top ghost slot: keep held safely at staging height so user can orbit & finish stacking
+      setStashedBlockId(session.blockId);
+      setDragBlockId(null);
+      setDragPhase('IDLE');
+      setIsAlignedWithSlot(false);
+      return;
+    }
+
+    // Released during PULLING phase
+    if (body) {
+      body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    }
+    setDragBlockId(null);
+    setDragPhase('IDLE');
+  }, [gl.domElement, onPlaceBlock]);
+
+  useEffect(() => {
+    const onWindowPointerUp = () => {
+      if (dragSessionRef.current) {
+        finishRelease();
+      }
+    };
+    window.addEventListener('pointerup', onWindowPointerUp);
+    window.addEventListener('pointercancel', onWindowPointerUp);
+    return () => {
+      window.removeEventListener('pointerup', onWindowPointerUp);
+      window.removeEventListener('pointercancel', onWindowPointerUp);
+    };
+  }, [finishRelease]);
+
+  const handlePointerOver = useCallback(
+    (blockId: number, _e: ThreeEvent<PointerEvent>) => {
+      if (dragSessionRef.current) return;
+      if (!isMyTurn || status !== 'PLAYING') return;
+
+      setHoveredBlockId(blockId);
+      const legal = canInteractBlock(blockId) || stashedBlockId === blockId;
+      gl.domElement.style.cursor = legal ? 'grab' : 'not-allowed';
+      soundEngine.playHover(legal);
+      onHoverBlock(legal ? blockId : null);
+    },
+    [isMyTurn, status, canInteractBlock, stashedBlockId, gl.domElement, onHoverBlock]
+  );
+
+  const handlePointerOut = useCallback(
+    (blockId: number) => {
+      if (dragSessionRef.current) return;
+      setHoveredBlockId((prev) => (prev === blockId ? null : prev));
+      gl.domElement.style.cursor = 'auto';
+      onHoverBlock(null);
+    },
+    [gl.domElement, onHoverBlock]
+  );
+
+  const handlePointerDown = useCallback(
+    (blockId: number, e: ThreeEvent<PointerEvent>) => {
+      if (e.button !== 0) return;
+      if (!isMyTurn || status !== 'PLAYING') return;
+
+      const isResumingStashed = stashedBlockId === blockId;
+      if (!isResumingStashed && !canInteractBlock(blockId)) {
+        soundEngine.playHover(false);
+        return;
+      }
+
+      const body = bodyRefs.current.get(blockId);
+      if (!body) return;
+
+      soundEngine.unlock();
+      soundEngine.playSelect();
+      setOrbitEnabled(false);
+      gl.domElement.style.cursor = 'grabbing';
+
+      const t = body.translation();
+      const r = body.rotation();
+      const blockPos = new THREE.Vector3(t.x, t.y, t.z);
+      const blockQuat = new THREE.Quaternion(r.x, r.y, r.z, r.w);
+
+      // Longitudinal axis in world space (block length runs along local Z)
+      const pullAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(blockQuat).normalize();
+      const dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -e.point.y);
+
+      const initialPhase: DragPhase = isResumingStashed ? 'PLACING' : 'PULLING';
+      const initialSlot = validTopSlots[0] ?? null;
+
+      dragSessionRef.current = {
+        blockId,
+        phase: initialPhase,
+        startBlockPos: blockPos.clone(),
+        startHitPoint: e.point.clone(),
+        pullAxis,
+        dragPlane,
+        committed: activeBlockId === blockId || isResumingStashed,
+        targetPlacement: initialSlot,
+        alignedWithSlot: false,
+      };
+
+      setDragBlockId(blockId);
+      setDragPhase(initialPhase);
+      setActiveTargetSlot(initialSlot);
+      onGrabBlock(blockId, activeBlockId === blockId || isResumingStashed);
+    },
+    [
+      isMyTurn,
+      status,
+      stashedBlockId,
+      canInteractBlock,
+      gl.domElement,
+      validTopSlots,
+      activeBlockId,
+      onGrabBlock,
+    ]
+  );
+
+  const handleBlockCollision = useCallback(
+    (blockId: number, payload: CollisionEnterPayload) => {
+      const otherName = payload.other.rigidBodyObject?.name ?? '';
+
+      // Play subtle wood clack based on velocity magnitude
+      const targetBody = payload.target.rigidBody;
+      if (targetBody && performance.now() > spawnProtectionUntilRef.current) {
+        const v = targetBody.linvel();
+        const speed = Math.hypot(v.x, v.y, v.z);
+        if (speed > 0.45) {
+          soundEngine.playImpact(Math.min(1, speed / 7.5));
+        }
+      }
+
+      if (!isLocalSimulator) return;
+      if (performance.now() < spawnProtectionUntilRef.current) return;
+      if (
+        dragSessionRef.current?.blockId === blockId ||
+        dragBlockId === blockId ||
+        stashedBlockId === blockId
+      ) {
+        return;
+      }
+
+      const block = blocks.find((b) => b.id === blockId);
+      if (!block) return;
+
+      const hitFloor = otherName === 'floor-catcher';
+      const hitTable = otherName === 'table-surface';
+
+      if (hitFloor || (hitTable && block.layer > 0)) {
+        triggerCollapseOnce();
+      }
+    },
+    [isLocalSimulator, dragBlockId, stashedBlockId, blocks, triggerCollapseOnce]
+  );
+
+  useFrame((state, delta) => {
+    // 1. Handle active player drag & kinematic/dynamic spring projection
+    const session = dragSessionRef.current;
+    if (session && isLocalSimulator) {
+      const body = bodyRefs.current.get(session.blockId);
+      if (body) {
+        body.wakeUp();
+        raycasterRef.current.setFromCamera(pointer, camera);
+
+        if (session.phase === 'PULLING') {
+          const hitPoint = tempVecA;
+          const intersected = raycasterRef.current.ray.intersectPlane(
+            session.dragPlane,
+            hitPoint
+          );
+
+          if (intersected) {
+            const deltaPointer = tempVecB.copy(hitPoint).sub(session.startHitPoint);
+            const axisOffset = deltaPointer.dot(session.pullAxis);
+            const targetPos = session.startBlockPos
+              .clone()
+              .addScaledVector(session.pullAxis, axisOffset);
+
+            const cur = body.translation();
+            const curVec = new THREE.Vector3(cur.x, cur.y, cur.z);
+            const posErr = targetPos.sub(curVec);
+
+            // Spring-damped velocity along the block's longitudinal axis so neighbors react with real friction
+            const axisVel = THREE.MathUtils.clamp(posErr.dot(session.pullAxis) * 14, -9.5, 9.5);
+            const lateralErr = posErr
+              .clone()
+              .addScaledVector(session.pullAxis, -posErr.dot(session.pullAxis));
+
+            const vx = session.pullAxis.x * axisVel + lateralErr.x * 6.5;
+            const vz = session.pullAxis.z * axisVel + lateralErr.z * 6.5;
+            const curVel = body.linvel();
+            const vy = THREE.MathUtils.clamp(
+              (session.startBlockPos.y - cur.y) * 9 + curVel.y * 0.25,
+              -3.5,
+              3.5
+            );
+
+            body.setLinvel({ x: vx, y: vy, z: vz }, true);
+            const ang = body.angvel();
+            body.setAngvel({ x: ang.x * 0.35, y: ang.y * 0.35, z: ang.z * 0.35 }, true);
+
+            soundEngine.updateSlide(Math.abs(axisVel));
+
+            // Commit single-block lock once slid >= 0.35 units from slot
+            const pulledDist = curVec.distanceTo(session.startBlockPos);
+            if (!session.committed && pulledDist >= 0.35) {
+              session.committed = true;
+              onGrabBlock(session.blockId, true);
+            }
+
+            // Transition to PLACING once extracted clear of the 4.5-unit tower footprint
+            const radialDist = Math.hypot(cur.x, cur.z);
+            if (radialDist > 4.65) {
+              session.phase = 'PLACING';
+              session.committed = true;
+              session.targetPlacement = validTopSlots[0] ?? null;
+              setDragPhase('PLACING');
+              setActiveTargetSlot(session.targetPlacement);
+              soundEngine.stopSlide();
+              onGrabBlock(session.blockId, true);
+            }
+          }
+        } else if (session.phase === 'PLACING') {
+          const topSlot = validTopSlots[0] ?? session.targetPlacement;
+          const topY = (topSlot?.position[1] ?? 9.25) + 0.65;
+          const placePlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -topY);
+          const hitPoint = tempVecA;
+          const intersected = raycasterRef.current.ray.intersectPlane(placePlane, hitPoint);
+
+          if (intersected) {
+            // Find closest open slot on top layer
+            let chosenSlot = topSlot;
+            let bestDist = Infinity;
+            for (const candidate of validTopSlots) {
+              const d = Math.hypot(
+                hitPoint.x - candidate.position[0],
+                hitPoint.z - candidate.position[2]
+              );
+              if (d < bestDist) {
+                bestDist = d;
+                chosenSlot = candidate;
+              }
+            }
+
+            if (chosenSlot) {
+              session.targetPlacement = chosenSlot;
+              setActiveTargetSlot(chosenSlot);
+            }
+
+            const radialFromCenter = Math.hypot(hitPoint.x, hitPoint.z);
+            const aligned = Boolean(chosenSlot && radialFromCenter < 3.4 && bestDist < 2.25);
+            session.alignedWithSlot = aligned;
+            setIsAlignedWithSlot(aligned);
+
+            const targetX = aligned && chosenSlot ? chosenSlot.position[0] : THREE.MathUtils.clamp(hitPoint.x, -9, 9);
+            const targetZ = aligned && chosenSlot ? chosenSlot.position[2] : THREE.MathUtils.clamp(hitPoint.z, -9, 9);
+            const targetY =
+              aligned && chosenSlot ? chosenSlot.position[1] + 0.24 : topY + 0.55;
+
+            const cur = body.translation();
+            const smoothFactor = 1 - Math.exp(-16 * delta);
+            const nextPos = {
+              x: THREE.MathUtils.lerp(cur.x, targetX, smoothFactor),
+              y: THREE.MathUtils.lerp(cur.y, targetY, smoothFactor),
+              z: THREE.MathUtils.lerp(cur.z, targetZ, smoothFactor),
+            };
+            body.setNextKinematicTranslation(nextPos);
+
+            const curRot = body.rotation();
+            tempQuatA.set(curRot.x, curRot.y, curRot.z, curRot.w);
+            if (chosenSlot) {
+              tempQuatB.set(
+                chosenSlot.quaternion[0],
+                chosenSlot.quaternion[1],
+                chosenSlot.quaternion[2],
+                chosenSlot.quaternion[3]
+              );
+            } else {
+              tempQuatB.copy(tempQuatA);
+            }
+            tempQuatA.slerp(tempQuatB, smoothFactor);
+            body.setNextKinematicRotation({
+              x: tempQuatA.x,
+              y: tempQuatA.y,
+              z: tempQuatA.z,
+              w: tempQuatA.w,
+            });
+          }
+        }
+      }
+    }
+
+    // 2. Wake sleeping blocks slightly when tower is disturbed & check tilt/fall collapse
+    if (isLocalSimulator && performance.now() > spawnProtectionUntilRef.current) {
+      for (const block of blocks) {
+        if (
+          dragSessionRef.current?.blockId === block.id ||
+          block.id === dragBlockId ||
+          block.id === stashedBlockId
+        ) {
+          continue;
+        }
+        const body = bodyRefs.current.get(block.id);
+        if (!body) continue;
+
+        const t = body.translation();
+        if (t.y < -0.25 || (block.layer > 0 && t.y < BLOCK_HEIGHT * 0.68)) {
+          triggerCollapseOnce();
+          break;
+        }
+
+        // Check severe block tilt (> ~55 deg) indicating structural collapse onto table/side
+        const r = body.rotation();
+        tempQuatA.set(r.x, r.y, r.z, r.w);
+        const upY = tempVecB.set(0, 1, 0).applyQuaternion(tempQuatA).y;
+        if (upY < 0.52) {
+          triggerCollapseOnce();
+          break;
+        }
+      }
+    }
+
+    // 3. Stream physics transforms at ~25 Hz when active player in online match
+    if (isLocalSimulator) {
+      const now = state.clock.elapsedTime * 1000;
+      if (now - lastSyncSentAtRef.current >= 40) {
+        lastSyncSentAtRef.current = now;
+        const compact: CompactBlockTuple[] = [];
+        for (const block of blocks) {
+          const body = bodyRefs.current.get(block.id);
+          if (!body) continue;
+          const t = body.translation();
+          const r = body.rotation();
+          compact.push([
+            block.id,
+            Number(t.x.toFixed(4)),
+            Number(t.y.toFixed(4)),
+            Number(t.z.toFixed(4)),
+            Number(r.x.toFixed(4)),
+            Number(r.y.toFixed(4)),
+            Number(r.z.toFixed(4)),
+            Number(r.w.toFixed(4)),
+          ]);
+        }
+        if (compact.length > 0) {
+          onPhysicsSync(compact);
+        }
+      }
+    } else {
+      // 4. Spectator / opponent smooth kinematic interpolation
+      const interpAlpha = 1 - Math.exp(-18 * delta);
+      for (const block of blocks) {
+        const body = bodyRefs.current.get(block.id);
+        const target = remotePhysicsFrames.current.get(block.id);
+        if (!body || !target) continue;
+
+        const curT = body.translation();
+        const curR = body.rotation();
+        tempVecA.set(curT.x, curT.y, curT.z).lerp(target.pos, interpAlpha);
+        tempQuatA.set(curR.x, curR.y, curR.z, curR.w).slerp(target.quat, interpAlpha);
+
+        body.setNextKinematicTranslation({
+          x: tempVecA.x,
+          y: tempVecA.y,
+          z: tempVecA.z,
+        });
+        body.setNextKinematicRotation({
+          x: tempQuatA.x,
+          y: tempQuatA.y,
+          z: tempQuatA.z,
+          w: tempQuatA.w,
+        });
+      }
+    }
+  });
+
+  return (
+    <>
+      <OrbitControls
+        ref={controlsRef}
+        makeDefault
+        enabled={orbitEnabled}
+        enableDamping
+        dampingFactor={0.07}
+        target={defaultTarget}
+        minDistance={6.5}
+        maxDistance={26}
+        maxPolarAngle={Math.PI * 0.485}
+        minPolarAngle={0.14}
+      />
+
+      <EnvironmentScene />
+
+      {blocks.map((block) => {
+        const isHeldKinematic =
+          (dragBlockId === block.id && dragPhase === 'PLACING') ||
+          stashedBlockId === block.id;
+        const blockDynamic = isLocalSimulator && !isHeldKinematic;
+        const isHovered = hoveredBlockId === block.id && isMyTurn && status === 'PLAYING';
+        const isIllegalHover =
+          isHovered &&
+          stashedBlockId !== block.id &&
+          !canInteractBlock(block.id);
+        const isLegalHover = isHovered && !isIllegalHover;
+
+        return (
+          <JengaBlock
+            key={`${matchResetVersion}-${block.id}`}
+            block={block}
+            isDynamic={blockDynamic}
+            isHovered={isLegalHover}
+            isRemoteHovered={!isMyTurn && remoteHoveredBlockId === block.id}
+            isIllegalHover={isIllegalHover}
+            isActiveCommitted={
+              activeBlockId === block.id ||
+              (!isMyTurn && remoteGrabbedBlockId === block.id)
+            }
+            isBeingDragged={dragBlockId === block.id || stashedBlockId === block.id}
+            registerBody={registerBody}
+            onPointerOverBlock={handlePointerOver}
+            onPointerOutBlock={handlePointerOut}
+            onPointerDownBlock={handlePointerDown}
+            onBlockCollision={handleBlockCollision}
+          />
+        );
+      })}
+
+      {(dragPhase === 'PLACING' || stashedBlockId !== null) && isMyTurn && status === 'PLAYING' && (
+        <GhostPlacementGuides
+          slots={validTopSlots}
+          activeSlot={activeTargetSlot ?? validTopSlots[0] ?? null}
+          isAligned={isAlignedWithSlot}
+        />
+      )}
+    </>
+  );
+}
+
+export function JengaTower(props: JengaTowerProps) {
+  return (
+    <Physics
+      key={props.matchResetVersion}
+      gravity={[0, -9.81, 0]}
+      timeStep={1 / 60}
+      numSolverIterations={16}
+      numInternalPgsIterations={8}
+    >
+      <TowerPhysicsContent {...props} />
+    </Physics>
+  );
+}

@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #16110d;
+}
+
+/* Custom subtle scrollbars for chat log */
+.jenga-scroll::-webkit-scrollbar {
+  width: 5px;
+}
+
+.jenga-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.jenga-scroll::-webkit-scrollbar-thumb {
+  background: rgba(214, 180, 140, 0.25);
+  border-radius: 9999px;
+}
+
+.jenga-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(214, 180, 140, 0.45);
+}

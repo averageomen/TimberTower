@@ -1,0 +1,23 @@
+services:
+  jenga-server:
+    # Option 1: Build directly from the local ./server folder copied to your UGREEN NAS
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    # Option 2: Pull the prebuilt multi-arch image from GitHub Container Registry
+    # (comment out the `build:` block above and uncomment `image:` below with your GitHub username)
+    # image: ghcr.io/<your-github-username>/jenga-server:latest
+    container_name: jenga-server
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - CLIENT_ORIGIN=*
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,13 @@
+{
+  "name": "jenga-3d-multiplayer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Full-stack multiplayer 3D Jenga web application with Rapier physics, procedural audio, and Socket.IO",
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "build": "npm --prefix server run build && npm --prefix client run build",
+    "build:exe": "npm --prefix client run build:exe"
+  }
+}
