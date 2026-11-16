@@ -211,6 +211,17 @@ export default function App() {
     setSupabaseConfig(updated);
   }, []);
 
+  // Switch background jazz track between Main Menu, Waiting Lobby, and Active Game
+  useEffect(() => {
+    if (!activeRoomState) {
+      soundEngine.setMusicTrack('MENU');
+    } else if (activeRoomState.status === 'WAITING') {
+      soundEngine.setMusicTrack('WAITING');
+    } else {
+      soundEngine.setMusicTrack('GAME');
+    }
+  }, [activeRoomState]);
+
   // Trigger explosion audio when a player is eliminated in Elimination Tower mode
   useEffect(() => {
     const eliminatedAt = activeRoomState?.lastEliminatedAt ?? null;
@@ -680,6 +691,8 @@ export default function App() {
           supabaseConfig={supabaseConfig}
           initialRoomCode={initialRoomCode}
           errorMessage={lobbyError}
+          muted={muted}
+          onToggleMute={handleToggleMute}
           onSaveSupabaseConfig={handleSaveSupabaseConfig}
           onSetOnlineRulesMode={handleSetOnlineRulesMode}
           onCreateOnlineRoom={handleCreateOnlineRoom}

@@ -105,6 +105,43 @@ interface TopBlockBox {
   hz: number;
 }
 
+function driveBodyTowardPose(
+  body: RapierRigidBody,
+  targetX: number,
+  targetY: number,
+  targetZ: number,
+  targetQuat: THREE.Quaternion,
+  maxLinearSpeed = 14
+): void {
+  const cur = body.translation();
+  const vx = THREE.MathUtils.clamp((targetX - cur.x) * 14, -maxLinearSpeed, maxLinearSpeed);
+  const vy = THREE.MathUtils.clamp((targetY - cur.y) * 14, -12, 12);
+  const vz = THREE.MathUtils.clamp((targetZ - cur.z) * 14, -maxLinearSpeed, maxLinearSpeed);
+  body.setLinvel({ x: vx, y: vy, z: vz }, true);
+
+  const curRot = body.rotation();
+  const curQuat = new THREE.Quaternion(curRot.x, curRot.y, curRot.z, curRot.w);
+  const dq = targetQuat.clone().multiply(curQuat.invert());
+  if (dq.w < 0) {
+    dq.set(-dq.x, -dq.y, -dq.z, -dq.w);
+  }
+  const angle = 2 * Math.acos(THREE.MathUtils.clamp(dq.w, -1, 1));
+  if (angle > 0.002) {
+    const sinHalf = Math.sqrt(Math.max(1e-8, 1 - dq.w * dq.w));
+    const speed = Math.min(12, angle * 12);
+    body.setAngvel(
+      {
+        x: (dq.x / sinHalf) * speed,
+        y: (dq.y / sinHalf) * speed,
+        z: (dq.z / sinHalf) * speed,
+      },
+      true
+    );
+  } else {
+    body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  }
+}
+
 function resolveNonOverlappingPlacement(
   desiredX: number,
   desiredZ: number,
@@ -116,15 +153,16 @@ function resolveNonOverlappingPlacement(
   const { hx, hy, hz } = getWorldHalfExtents(placedQuat);
   let x = desiredX;
   let z = desiredZ;
-  const gap = 0.02;
+  const gap = 0.04;
+  const maxOffset = 2.25;
 
-  // Separate horizontally from blocks sitting on the same top layer so blocks never overlap
+  // Separate horizontally from every block on the same top layer so blocks never overlap
   if (allowNudge) {
     const sameLayerBlocks = nearbyBlocks.filter(
       (b) => Math.abs(b.y - baseSlotY) < BLOCK_HEIGHT * 0.9
     );
 
-    for (let pass = 0; pass < 2; pass++) {
+    for (let pass = 0; pass < 3; pass++) {
       for (const other of sameLayerBlocks) {
         const reqX = hx + other.hx + gap;
         const reqZ = hz + other.hz + gap;
@@ -134,17 +172,23 @@ function resolveNonOverlappingPlacement(
         const oz = reqZ - Math.abs(dz);
 
         if (ox > 0 && oz > 0) {
-          if (ox <= oz && ox < reqX * 0.72) {
-            const signX = dx >= 0 ? 1 : -1;
-            const candidateX = other.x + signX * reqX;
-            if (Math.abs(candidateX) <= 2.35) {
-              x = candidateX;
+          if (ox <= oz) {
+            const primarySign = dx >= 0 ? 1 : -1;
+            const firstTry = other.x + primarySign * reqX;
+            const secondTry = other.x - primarySign * reqX;
+            if (Math.abs(firstTry) <= maxOffset) {
+              x = firstTry;
+            } else if (Math.abs(secondTry) <= maxOffset) {
+              x = secondTry;
             }
-          } else if (oz < ox && oz < reqZ * 0.72) {
-            const signZ = dz >= 0 ? 1 : -1;
-            const candidateZ = other.z + signZ * reqZ;
-            if (Math.abs(candidateZ) <= 2.35) {
-              z = candidateZ;
+          } else {
+            const primarySign = dz >= 0 ? 1 : -1;
+            const firstTry = other.z + primarySign * reqZ;
+            const secondTry = other.z - primarySign * reqZ;
+            if (Math.abs(firstTry) <= maxOffset) {
+              z = firstTry;
+            } else if (Math.abs(secondTry) <= maxOffset) {
+              z = secondTry;
             }
           }
         }
@@ -152,12 +196,12 @@ function resolveNonOverlappingPlacement(
     }
   }
 
-  // Compute exact support surface Y beneath (x, z) so overlapping placement stacks on top instead of clipping
+  // Compute exact support surface Y beneath (x, z) so any vertical overlap stacks cleanly on top
   let supportSurfaceY = Math.max(0, baseSlotY - BLOCK_HEIGHT / 2);
   for (const other of nearbyBlocks) {
     const ox = hx + other.hx - Math.abs(x - other.x);
     const oz = hz + other.hz - Math.abs(z - other.z);
-    if (ox > 0.06 && oz > 0.06) {
+    if (ox > 0.04 && oz > 0.04) {
       const topY = other.y + other.hy;
       if (topY > supportSurfaceY) {
         supportSurfaceY = topY;
@@ -266,6 +310,8 @@ function TowerPhysicsContent({
     yawSteps: number;
     isOnSide: boolean;
     hasCustomRotation: boolean;
+    holdPos: THREE.Vector3;
+    holdQuat: THREE.Quaternion;
   } | null>(null);
 
   const tempVecA = useMemo(() => new THREE.Vector3(), []);
@@ -382,16 +428,10 @@ function TowerPhysicsContent({
         slot.position[1] + getWorldHalfExtents(finalQuat).hy - BLOCK_HEIGHT / 2 + 0.05,
         slot.position[2],
       ];
-      body.setTranslation({ x: dropPos[0], y: dropPos[1], z: dropPos[2] }, true);
-      body.setRotation(
-        {
-          x: finalQuat.x,
-          y: finalQuat.y,
-          z: finalQuat.z,
-          w: finalQuat.w,
-        },
-        true
-      );
+
+      // Release under full dynamic solid physics without teleporting inside neighbors
+      body.setLinvel({ x: 0, y: -0.4, z: 0 }, true);
+      body.setAngvel({ x: 0, y: 0, z: 0 }, true);
       body.wakeUp();
 
       soundEngine.playPlace();
@@ -423,27 +463,30 @@ function TowerPhysicsContent({
           resolvedLayer,
           slot.slot
         );
-      }, 180);
+      }, 220);
       return;
     }
 
     if (session.phase === 'PLACING') {
-      // Released outside the top slot: park safely outside & above the tower so user can orbit & finish stacking
+      // Released outside the top slot: hold safely in mid-air outside the tower via solid dynamic spring
+      const topY = (validTopSlots[0]?.position[1] ?? 9.25) + 0.85;
+      const cur = body?.translation();
+      const curX = cur?.x ?? session.stagePoint?.x ?? 6.2;
+      const curY = cur?.y ?? topY;
+      const curZ = cur?.z ?? session.stagePoint?.z ?? 0;
+      const radial = Math.hypot(curX, curZ);
+      const safeX = radial < 5.2 && session.stagePoint ? session.stagePoint.x : curX;
+      const safeZ = radial < 5.2 && session.stagePoint ? session.stagePoint.z : curZ;
+      const safeY = Math.max(curY, topY);
+
       stashedOrientationRef.current = {
         blockId: session.blockId,
         yawSteps: session.yawSteps,
         isOnSide: session.isOnSide,
         hasCustomRotation: session.hasCustomRotation,
+        holdPos: new THREE.Vector3(safeX, safeY, safeZ),
+        holdQuat: session.targetQuat.clone(),
       };
-      if (body && session.stagePoint) {
-        const topY = (validTopSlots[0]?.position[1] ?? 9.25) + 0.85;
-        const cur = body.translation();
-        const radial = Math.hypot(cur.x, cur.z);
-        const safeX = radial < 5.2 ? session.stagePoint.x : cur.x;
-        const safeZ = radial < 5.2 ? session.stagePoint.z : cur.z;
-        const safeY = Math.max(cur.y, topY);
-        body.setNextKinematicTranslation({ x: safeX, y: safeY, z: safeZ });
-      }
       setStashedBlockId(session.blockId);
       setDragBlockId(null);
       setDragPhase('IDLE');
@@ -776,7 +819,8 @@ function TowerPhysicsContent({
 
             const cur = body.translation();
             const showGuides = blocksMovedCount < 5;
-            const clearedTopHeight = cur.y >= topY - 0.35;
+            const clearedTopHeight = cur.y >= topY - 0.15;
+            const radial = Math.hypot(cur.x, cur.z);
             const radialFromCenter = Math.hypot(hitPoint.x, hitPoint.z);
 
             const aligned = clearedTopHeight
@@ -792,11 +836,11 @@ function TowerPhysicsContent({
             let targetZ: number;
             let targetY: number;
 
-            if (!clearedTopHeight && session.stagePoint) {
-              // Lift straight up outside the tower first before gliding over the top
+            if (!clearedTopHeight && radial > 3.6 && session.stagePoint) {
+              // Lift straight up outside the tower in open air before moving inward over the top
               targetX = session.stagePoint.x;
               targetZ = session.stagePoint.z;
-              targetY = topY + 0.55;
+              targetY = topY + 0.65;
               session.freePlacePos = null;
             } else if (aligned && chosenSlot) {
               // Gather live boxes of existing upper-layer blocks to avoid any overlap
@@ -823,11 +867,11 @@ function TowerPhysicsContent({
               const desiredX =
                 showGuides && !session.hasCustomRotation
                   ? chosenSlot.position[0]
-                  : THREE.MathUtils.clamp(hitPoint.x, -2.3, 2.3);
+                  : THREE.MathUtils.clamp(hitPoint.x, -2.25, 2.25);
               const desiredZ =
                 showGuides && !session.hasCustomRotation
                   ? chosenSlot.position[2]
-                  : THREE.MathUtils.clamp(hitPoint.z, -2.3, 2.3);
+                  : THREE.MathUtils.clamp(hitPoint.z, -2.25, 2.25);
 
               const resolved = resolveNonOverlappingPlacement(
                 desiredX,
@@ -840,34 +884,37 @@ function TowerPhysicsContent({
 
               targetX = resolved.x;
               targetZ = resolved.z;
-              targetY = resolved.y + 0.14;
+              targetY = resolved.y + 0.18;
               session.freePlacePos = [resolved.x, resolved.y, resolved.z];
             } else {
               targetX = THREE.MathUtils.clamp(hitPoint.x, -9, 9);
               targetZ = THREE.MathUtils.clamp(hitPoint.z, -9, 9);
-              targetY = topY + 0.55;
+              targetY = topY + 0.65;
               session.freePlacePos = null;
             }
 
-            const smoothFactor = 1 - Math.exp(-16 * delta);
-            const nextPos = {
-              x: THREE.MathUtils.lerp(cur.x, targetX, smoothFactor),
-              y: THREE.MathUtils.lerp(cur.y, targetY, smoothFactor),
-              z: THREE.MathUtils.lerp(cur.z, targetZ, smoothFactor),
-            };
-            body.setNextKinematicTranslation(nextPos);
-
-            const curRot = body.rotation();
-            tempQuatA.set(curRot.x, curRot.y, curRot.z, curRot.w);
-            tempQuatA.slerp(session.targetQuat, smoothFactor);
-            body.setNextKinematicRotation({
-              x: tempQuatA.x,
-              y: tempQuatA.y,
-              z: tempQuatA.z,
-              w: tempQuatA.w,
-            });
+            driveBodyTowardPose(body, targetX, targetY, targetZ, session.targetQuat, 14);
           }
         }
+      }
+    } else if (
+      stashedBlockId !== null &&
+      isLocalSimulator &&
+      stashedOrientationRef.current?.blockId === stashedBlockId
+    ) {
+      // Keep stashed dynamic solid brick suspended safely outside the tower while orbiting
+      const stashedBody = bodyRefs.current.get(stashedBlockId);
+      if (stashedBody) {
+        stashedBody.wakeUp();
+        const hold = stashedOrientationRef.current;
+        driveBodyTowardPose(
+          stashedBody,
+          hold.holdPos.x,
+          hold.holdPos.y,
+          hold.holdPos.z,
+          hold.holdQuat,
+          10
+        );
       }
     }
 
@@ -976,10 +1023,6 @@ function TowerPhysicsContent({
       <EnvironmentScene />
 
       {blocks.map((block) => {
-        const isHeldKinematic =
-          (dragBlockId === block.id && dragPhase === 'PLACING') ||
-          stashedBlockId === block.id;
-        const blockDynamic = isLocalSimulator && !isHeldKinematic;
         const isHovered = hoveredBlockId === block.id && isMyTurn && status === 'PLAYING';
         const isIllegalHover =
           isHovered &&
@@ -991,8 +1034,7 @@ function TowerPhysicsContent({
           <JengaBlock
             key={`${matchResetVersion}-${block.id}`}
             block={block}
-            isDynamic={blockDynamic}
-            isSensor={isHeldKinematic}
+            isDynamic={isLocalSimulator}
             isHovered={isLegalHover}
             isRemoteHovered={!isMyTurn && remoteHoveredBlockId === block.id}
             isIllegalHover={isIllegalHover}

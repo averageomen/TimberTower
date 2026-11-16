@@ -15,6 +15,8 @@ import {
   Sparkles,
   Trash2,
   Users,
+  Volume2,
+  VolumeX,
   Wifi,
 } from 'lucide-react';
 import { SupabaseConfig } from '../network/supabaseClient';
@@ -72,6 +74,8 @@ interface LobbyProps {
   supabaseConfig: SupabaseConfig;
   initialRoomCode: string;
   errorMessage: string | null;
+  muted: boolean;
+  onToggleMute: () => void;
   onSaveSupabaseConfig: (url: string, anonKey: string) => void;
   onSetOnlineRulesMode: (rulesMode: GameRulesMode) => void;
   onCreateOnlineRoom: (playerName: string) => void;
@@ -89,6 +93,8 @@ export function Lobby({
   supabaseConfig,
   initialRoomCode,
   errorMessage,
+  muted,
+  onToggleMute,
   onSaveSupabaseConfig,
   onSetOnlineRulesMode,
   onCreateOnlineRoom,
@@ -236,23 +242,38 @@ export function Lobby({
                 </p>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => setShowServerConfig((v) => !v)}
-              title="Configure Supabase connection"
-              className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition hover:brightness-110 ${
-                connected
-                  ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30'
-                  : 'bg-stone-800 text-stone-400 ring-1 ring-stone-700'
-              }`}
-            >
-              <Wifi className="h-3 w-3" />
-              {connected
-                ? 'Supabase Online'
-                : supabaseConfig.isConfigured
-                  ? 'Connecting...'
-                  : 'Setup Supabase'}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onToggleMute}
+                title={muted ? 'Unmute music & sound effects' : 'Mute music & sound effects'}
+                aria-label={muted ? 'Unmute audio' : 'Mute audio'}
+                className={`flex h-7 w-7 items-center justify-center rounded-full border transition hover:brightness-110 ${
+                  muted
+                    ? 'border-red-500/40 bg-red-950/50 text-red-300'
+                    : 'border-stone-700 bg-stone-800/80 text-amber-200'
+                }`}
+              >
+                {muted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowServerConfig((v) => !v)}
+                title="Configure Supabase connection"
+                className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition hover:brightness-110 ${
+                  connected
+                    ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30'
+                    : 'bg-stone-800 text-stone-400 ring-1 ring-stone-700'
+                }`}
+              >
+                <Wifi className="h-3 w-3" />
+                {connected
+                  ? 'Supabase Online'
+                  : supabaseConfig.isConfigured
+                    ? 'Connecting...'
+                    : 'Setup Supabase'}
+              </button>
+            </div>
           </div>
         </div>
 

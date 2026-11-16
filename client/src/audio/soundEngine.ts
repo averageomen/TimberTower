@@ -1,8 +1,10 @@
+export type MusicTrack = 'MENU' | 'WAITING' | 'GAME' | 'NONE';
+
 type SoundKey =
   | 'wood_tap'
   | 'wood_place'
   | 'wood_slide'
-  | 'tower_collapse'
+  | 'lego_break'
   | 'crash'
   | 'explosion'
   | 'turn_chime'
@@ -21,9 +23,9 @@ const SOUND_SOURCES: Record<SoundKey, { local: string; remote: string }> = {
     local: './sounds/wood_slide.ogg',
     remote: 'https://actions.google.com/sounds/v1/doors/wood_door_open.ogg',
   },
-  tower_collapse: {
-    local: './sounds/tower_collapse.ogg',
-    remote: 'https://actions.google.com/sounds/v1/sports/bowling_strike.ogg',
+  lego_break: {
+    local: './sounds/lego_break.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/lego-breaking.mp3',
   },
   crash: {
     local: './sounds/crash.ogg',
@@ -43,6 +45,23 @@ const SOUND_SOURCES: Record<SoundKey, { local: string; remote: string }> = {
   },
 };
 
+const MUSIC_SOURCES: Record<Exclude<MusicTrack, 'NONE'>, { local: string; remote: string }> = {
+  MENU: {
+    local: './sounds/jazz_menu.mp3',
+    remote: 'https://incompetech.com/music/royalty-free/mp3-royaltyfree/Lobby%20Time.mp3',
+  },
+  WAITING: {
+    local: './sounds/jazz_waiting.mp3',
+    remote: 'https://incompetech.com/music/royalty-free/mp3-royaltyfree/Jazz%20Brunch.mp3',
+  },
+  GAME: {
+    local: './sounds/jazz_game.mp3',
+    remote: 'https://incompetech.com/music/royalty-free/mp3-royaltyfree/Bossa%20Antigua.mp3',
+  },
+};
+
+const MUSIC_VOLUME = 0.22;
+
 class SoundEngine {
   private ctx: AudioContext | null = null;
   private muted = false;
@@ -52,8 +71,21 @@ class SoundEngine {
   private slideSource: AudioBufferSourceNode | null = null;
   private slideGain: GainNode | null = null;
 
+  private currentTrack: MusicTrack = 'NONE';
+  private musicElements = new Map<Exclude<MusicTrack, 'NONE'>, HTMLAudioElement>();
+
   private lastImpactAt = 0;
   private lastHoverAt = 0;
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      const onFirstGesture = () => {
+        this.unlock();
+      };
+      window.addEventListener('pointerdown', onFirstGesture, { once: true });
+      window.addEventListener('keydown', onFirstGesture, { once: true });
+    }
+  }
 
   private ensureContext(): AudioContext | null {
     if (this.muted || typeof window === 'undefined') return null;
@@ -167,14 +199,89 @@ class SoundEngine {
     }
   }
 
+  private getOrCreateMusicElement(
+    track: Exclude<MusicTrack, 'NONE'>
+  ): HTMLAudioElement | null {
+    if (typeof window === 'undefined' || typeof Audio === 'undefined') return null;
+
+    let audio = this.musicElements.get(track);
+    if (!audio) {
+      const source = MUSIC_SOURCES[track];
+      audio = new Audio(source.local);
+      audio.loop = true;
+      audio.preload = 'auto';
+      audio.volume = MUSIC_VOLUME;
+
+      let triedRemote = false;
+      audio.addEventListener('error', () => {
+        if (triedRemote) return;
+        triedRemote = true;
+        audio!.src = source.remote;
+        audio!.load();
+        if (this.currentTrack === track && !this.muted) {
+          void audio!.play().catch(() => {});
+        }
+      });
+
+      this.musicElements.set(track, audio);
+    }
+    return audio;
+  }
+
+  private startCurrentMusic(resetTime = false): void {
+    if (this.muted || this.currentTrack === 'NONE') return;
+    const audio = this.getOrCreateMusicElement(this.currentTrack);
+    if (!audio) return;
+
+    if (resetTime) {
+      try {
+        audio.currentTime = 0;
+      } catch {
+        // Ignore if audio metadata is not ready yet
+      }
+    }
+
+    if (audio.paused) {
+      void audio.play().catch(() => {});
+    }
+  }
+
+  public setMusicTrack(track: MusicTrack): void {
+    const changed = this.currentTrack !== track;
+    this.currentTrack = track;
+
+    for (const [key, audio] of this.musicElements.entries()) {
+      if (key !== track && !audio.paused) {
+        audio.pause();
+      }
+    }
+
+    if (track === 'NONE' || this.muted) {
+      return;
+    }
+
+    this.startCurrentMusic(changed);
+  }
+
   public unlock(): void {
     this.ensureContext();
+    this.startCurrentMusic(false);
   }
 
   public setMuted(muted: boolean): void {
     this.muted = muted;
-    if (muted && this.slideGain && this.ctx) {
-      this.slideGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.03);
+    if (muted) {
+      if (this.slideGain && this.ctx) {
+        this.slideGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.03);
+      }
+      for (const audio of this.musicElements.values()) {
+        if (!audio.paused) {
+          audio.pause();
+        }
+      }
+    } else {
+      this.ensureContext();
+      this.startCurrentMusic(false);
     }
   }
 
@@ -229,8 +336,7 @@ class SoundEngine {
 
   public playCollapse(): void {
     this.stopSlide();
-    this.playBuffer('tower_collapse', 0.85, 0.95);
-    this.playBuffer('crash', 0.65, 1.0, 0.12);
+    this.playBuffer('lego_break', 0.95, 1.0);
   }
 
   public playExplosion(): void {
