@@ -1,0 +1,38 @@
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: jenga-tailscale
+    hostname: ugreen-jenga
+    network_mode: host
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - ./tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:?Set TS_AUTHKEY in .env or UGOS environment}
+      - TS_STATE_DIR=/var/lib/tailscale
+
+  jenga-server:
+    # Option 1: Build from ./server
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    # Option 2: Pull prebuilt image from GitHub Container Registry
+    # image: ghcr.io/<your-github-username>/jenga-server:latest
+    container_name: jenga-server
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - CLIENT_ORIGIN=*
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

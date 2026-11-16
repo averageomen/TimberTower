@@ -192,7 +192,7 @@ export function Lobby({
                       onUpdateServerUrl(serverDraft);
                     }
                   }}
-                  placeholder="http://192.168.1.50:3001"
+                  placeholder="http://100.x.y.z:3001"
                   className="flex-1 rounded-lg border border-stone-700 bg-stone-900 px-3 py-1.5 font-mono text-xs text-stone-100 outline-none focus:border-amber-400"
                 />
                 <button
@@ -203,6 +203,19 @@ export function Lobby({
                   Connect
                 </button>
               </div>
+              {!connected && (
+                <div className="mt-2 flex items-center justify-between text-[11px] text-stone-400">
+                  <span>Playing over Tailscale? Make sure Tailscale is running.</span>
+                  <a
+                    href="https://tailscale.com/download"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-medium text-amber-300 underline decoration-amber-400/40 hover:text-amber-200"
+                  >
+                    Get Tailscale
+                  </a>
+                </div>
+              )}
             </div>
           )}
 

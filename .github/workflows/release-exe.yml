@@ -31,7 +31,7 @@ jobs:
 
       - name: Build Windows portable & installer .exe
         env:
-          VITE_SERVER_URL: ${{ inputs.default_server_url }}
+          VITE_SERVER_URL: ${{ inputs.default_server_url || vars.JENGA_SERVER_URL }}
         run: npm --prefix client run build:exe
 
       - name: Upload .exe build artifacts
