@@ -667,7 +667,6 @@ export default function App() {
             blocks={sceneBlocks}
             status={sceneStatus}
             isMyTurn={isMyTurn}
-            blocksMovedCount={activeRoomState?.blocksMovedCount ?? 0}
             activeBlockId={activeRoomState?.activeBlockId ?? null}
             remoteHoveredBlockId={remoteHoveredBlockId}
             remoteGrabbedBlockId={remoteGrabbedBlockId}

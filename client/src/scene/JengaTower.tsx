@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Html, OrbitControls, RoundedBox } from '@react-three/drei';
+import { OrbitControls } from '@react-three/drei';
 import { ThreeEvent, useFrame, useThree } from '@react-three/fiber';
 import { CollisionEnterPayload, Physics, RapierRigidBody } from '@react-three/rapier';
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
@@ -25,7 +25,6 @@ interface JengaTowerProps {
   blocks: BlockState[];
   status: RoomStatus;
   isMyTurn: boolean;
-  blocksMovedCount: number;
   activeBlockId: number | null;
   remoteHoveredBlockId: number | null;
   remoteGrabbedBlockId: number | null;
@@ -216,64 +215,10 @@ function resolveNonOverlappingPlacement(
   };
 }
 
-function GhostPlacementGuides({
-  slots,
-  activeSlot,
-  isAligned,
-}: {
-  slots: PlacementSlot[];
-  activeSlot: PlacementSlot | null;
-  isAligned: boolean;
-}) {
-  return (
-    <group>
-      {slots.map((slot) => {
-        const isCurrent =
-          activeSlot?.layer === slot.layer && activeSlot?.slot === slot.slot;
-        const color = isCurrent && isAligned ? '#34d399' : '#fbbf24';
-        const opacity = isCurrent ? (isAligned ? 0.55 : 0.34) : 0.16;
-
-        return (
-          <group
-            key={`${slot.layer}-${slot.slot}`}
-            position={slot.position}
-            quaternion={slot.quaternion}
-          >
-            <RoundedBox args={[BLOCK_WIDTH, BLOCK_HEIGHT, BLOCK_LENGTH]} radius={0.04} smoothness={2}>
-              <meshStandardMaterial
-                color={color}
-                emissive={color}
-                emissiveIntensity={isCurrent && isAligned ? 0.65 : 0.25}
-                transparent
-                opacity={opacity}
-                depthWrite={false}
-              />
-            </RoundedBox>
-            {isCurrent && (
-              <Html position={[0, 0.65, 0]} center distanceFactor={14} zIndexRange={[15, 0]}>
-                <div
-                  className={`pointer-events-none whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold shadow-md backdrop-blur ${
-                    isAligned
-                      ? 'border border-emerald-400/70 bg-emerald-950/90 text-emerald-100'
-                      : 'border border-amber-400/60 bg-stone-900/90 text-amber-200'
-                  }`}
-                >
-                  {isAligned ? 'Release to Place' : 'Drag Here to Stack'}
-                </div>
-              </Html>
-            )}
-          </group>
-        );
-      })}
-    </group>
-  );
-}
-
 function TowerPhysicsContent({
   blocks,
   status,
   isMyTurn,
-  blocksMovedCount,
   activeBlockId,
   remoteHoveredBlockId,
   remoteGrabbedBlockId,
@@ -293,10 +238,7 @@ function TowerPhysicsContent({
   const [orbitEnabled, setOrbitEnabled] = useState(true);
   const [hoveredBlockId, setHoveredBlockId] = useState<number | null>(null);
   const [dragBlockId, setDragBlockId] = useState<number | null>(null);
-  const [dragPhase, setDragPhase] = useState<DragPhase>('IDLE');
   const [stashedBlockId, setStashedBlockId] = useState<number | null>(null);
-  const [activeTargetSlot, setActiveTargetSlot] = useState<PlacementSlot | null>(null);
-  const [isAlignedWithSlot, setIsAlignedWithSlot] = useState(false);
 
   const dragSessionRef = useRef<DragSession | null>(null);
   const raycasterRef = useRef(new THREE.Raycaster());
@@ -337,10 +279,7 @@ function TowerPhysicsContent({
     dragSessionRef.current = null;
     stashedOrientationRef.current = null;
     setDragBlockId(null);
-    setDragPhase('IDLE');
     setStashedBlockId(null);
-    setActiveTargetSlot(null);
-    setIsAlignedWithSlot(false);
     setOrbitEnabled(true);
     soundEngine.stopSlide();
 
@@ -437,10 +376,7 @@ function TowerPhysicsContent({
       soundEngine.playPlace();
       stashedOrientationRef.current = null;
       setDragBlockId(null);
-      setDragPhase('IDLE');
       setStashedBlockId(null);
-      setActiveTargetSlot(null);
-      setIsAlignedWithSlot(false);
 
       const resolvedLayer = Math.max(
         slot.layer,
@@ -489,8 +425,6 @@ function TowerPhysicsContent({
       };
       setStashedBlockId(session.blockId);
       setDragBlockId(null);
-      setDragPhase('IDLE');
-      setIsAlignedWithSlot(false);
       return;
     }
 
@@ -500,7 +434,6 @@ function TowerPhysicsContent({
       body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     }
     setDragBlockId(null);
-    setDragPhase('IDLE');
   }, [gl.domElement, onPlaceBlock]);
 
   useEffect(() => {
@@ -645,8 +578,6 @@ function TowerPhysicsContent({
       };
 
       setDragBlockId(blockId);
-      setDragPhase(initialPhase);
-      setActiveTargetSlot(initialSlot);
       onGrabBlock(blockId, activeBlockId === blockId || isResumingStashed);
     },
     [
@@ -777,8 +708,6 @@ function TowerPhysicsContent({
               session.targetQuat.copy(
                 buildPlacementQuaternion(session.yawSteps, session.isOnSide)
               );
-              setDragPhase('PLACING');
-              setActiveTargetSlot(targetSlot);
               soundEngine.stopSlide();
               onGrabBlock(session.blockId, true);
             }
@@ -808,7 +737,6 @@ function TowerPhysicsContent({
 
             if (chosenSlot) {
               session.targetPlacement = chosenSlot;
-              setActiveTargetSlot(chosenSlot);
               if (!session.hasCustomRotation) {
                 session.yawSteps = chosenSlot.layer % 2;
                 session.targetQuat.copy(
@@ -818,19 +746,15 @@ function TowerPhysicsContent({
             }
 
             const cur = body.translation();
-            const showGuides = blocksMovedCount < 5;
             const clearedTopHeight = cur.y >= topY - 0.15;
             const radial = Math.hypot(cur.x, cur.z);
             const radialFromCenter = Math.hypot(hitPoint.x, hitPoint.z);
 
             const aligned = clearedTopHeight
-              ? showGuides && !session.hasCustomRotation
-                ? Boolean(chosenSlot && radialFromCenter < 3.4 && bestDist < 2.25)
-                : Boolean(chosenSlot && radialFromCenter < 3.5)
+              ? Boolean(chosenSlot && radialFromCenter < 3.5)
               : false;
 
             session.alignedWithSlot = aligned;
-            setIsAlignedWithSlot(aligned);
 
             let targetX: number;
             let targetZ: number;
@@ -864,14 +788,8 @@ function TowerPhysicsContent({
                 });
               }
 
-              const desiredX =
-                showGuides && !session.hasCustomRotation
-                  ? chosenSlot.position[0]
-                  : THREE.MathUtils.clamp(hitPoint.x, -2.25, 2.25);
-              const desiredZ =
-                showGuides && !session.hasCustomRotation
-                  ? chosenSlot.position[2]
-                  : THREE.MathUtils.clamp(hitPoint.z, -2.25, 2.25);
+              const desiredX = THREE.MathUtils.clamp(hitPoint.x, -2.25, 2.25);
+              const desiredZ = THREE.MathUtils.clamp(hitPoint.z, -2.25, 2.25);
 
               const resolved = resolveNonOverlappingPlacement(
                 desiredX,
@@ -1051,17 +969,6 @@ function TowerPhysicsContent({
           />
         );
       })}
-
-      {blocksMovedCount < 5 &&
-        (dragPhase === 'PLACING' || stashedBlockId !== null) &&
-        isMyTurn &&
-        status === 'PLAYING' && (
-          <GhostPlacementGuides
-            slots={validTopSlots}
-            activeSlot={activeTargetSlot ?? validTopSlots[0] ?? null}
-            isAligned={isAlignedWithSlot}
-          />
-        )}
     </>
   );
 }
