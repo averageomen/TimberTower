@@ -1,5 +1,14 @@
 export type MusicTrack = 'MENU' | 'WAITING' | 'GAME' | 'NONE';
 
+export type GlobalSoundEvent =
+  | { type: 'SELECT' }
+  | { type: 'PLACE' }
+  | { type: 'IMPACT'; intensity: number }
+  | { type: 'SLIDE'; speed: number }
+  | { type: 'STOP_SLIDE' }
+  | { type: 'COLLAPSE' }
+  | { type: 'EXPLOSION' };
+
 type SoundKey =
   | 'wood_tap'
   | 'wood_place'
@@ -74,8 +83,16 @@ class SoundEngine {
   private currentTrack: MusicTrack = 'NONE';
   private musicElements = new Map<Exclude<MusicTrack, 'NONE'>, HTMLAudioElement>();
 
+  private broadcaster: ((event: GlobalSoundEvent) => void) | null = null;
+  private slideStopTimeout: number | null = null;
+
   private lastImpactAt = 0;
+  private lastImpactBroadcastAt = 0;
   private lastHoverAt = 0;
+  private lastPlaceAt = 0;
+  private lastSlideBroadcastAt = 0;
+  private lastCollapseAt = 0;
+  private lastExplosionAt = 0;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -84,6 +101,36 @@ class SoundEngine {
       };
       window.addEventListener('pointerdown', onFirstGesture, { once: true });
       window.addEventListener('keydown', onFirstGesture, { once: true });
+    }
+  }
+
+  public setBroadcaster(fn: ((event: GlobalSoundEvent) => void) | null): void {
+    this.broadcaster = fn;
+  }
+
+  public playRemoteEvent(event: GlobalSoundEvent): void {
+    switch (event.type) {
+      case 'SELECT':
+        this.playSelect(false);
+        break;
+      case 'PLACE':
+        this.playPlace(false);
+        break;
+      case 'IMPACT':
+        this.playImpact(event.intensity, false);
+        break;
+      case 'SLIDE':
+        this.updateSlide(event.speed, false);
+        break;
+      case 'STOP_SLIDE':
+        this.stopSlide(false);
+        break;
+      case 'COLLAPSE':
+        this.playCollapse(false);
+        break;
+      case 'EXPLOSION':
+        this.playExplosion(false);
+        break;
     }
   }
 
@@ -289,14 +336,33 @@ class SoundEngine {
     return this.muted;
   }
 
-  public updateSlide(speed: number): void {
+  public updateSlide(speed: number, broadcast = true): void {
+    const clamped = Math.min(Math.max(speed, 0), 10);
+    const nowMs = performance.now();
+
+    if (broadcast && this.broadcaster && nowMs - this.lastSlideBroadcastAt >= 80) {
+      this.lastSlideBroadcastAt = nowMs;
+      this.broadcaster({ type: 'SLIDE', speed: clamped });
+    }
+
     if (this.muted) return;
     const ctx = this.ensureContext();
     if (!ctx) return;
     this.ensureSlideLoop(ctx);
     if (!this.slideGain || !this.slideSource) return;
 
-    const clamped = Math.min(Math.max(speed, 0), 10);
+    if (this.slideStopTimeout !== null) {
+      window.clearTimeout(this.slideStopTimeout);
+      this.slideStopTimeout = null;
+    }
+
+    if (!broadcast && clamped > 0.12) {
+      this.slideStopTimeout = window.setTimeout(() => {
+        this.slideStopTimeout = null;
+        this.stopSlide(false);
+      }, 220);
+    }
+
     const activeGain = clamped > 0.12 ? Math.min(0.32, clamped * 0.055) : 0;
     const now = ctx.currentTime;
 
@@ -304,7 +370,14 @@ class SoundEngine {
     this.slideSource.playbackRate.setTargetAtTime(0.85 + clamped * 0.08, now, 0.05);
   }
 
-  public stopSlide(): void {
+  public stopSlide(broadcast = true): void {
+    if (this.slideStopTimeout !== null) {
+      window.clearTimeout(this.slideStopTimeout);
+      this.slideStopTimeout = null;
+    }
+    if (broadcast && this.broadcaster) {
+      this.broadcaster({ type: 'STOP_SLIDE' });
+    }
     if (!this.ctx || !this.slideGain) return;
     this.slideGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.03);
   }
@@ -316,31 +389,60 @@ class SoundEngine {
     this.playBuffer('wood_tap', legal ? 0.18 : 0.12, legal ? 1.35 : 0.72, 0, 0.12);
   }
 
-  public playSelect(): void {
+  public playSelect(broadcast = true): void {
+    if (broadcast && this.broadcaster) {
+      this.broadcaster({ type: 'SELECT' });
+    }
     this.playBuffer('wood_tap', 0.42, 1.05, 0, 0.25);
   }
 
-  public playPlace(): void {
+  public playPlace(broadcast = true): void {
+    const nowMs = performance.now();
+    if (nowMs - this.lastPlaceAt < 250) return;
+    this.lastPlaceAt = nowMs;
+
+    if (broadcast && this.broadcaster) {
+      this.broadcaster({ type: 'PLACE' });
+    }
     this.playBuffer('wood_place', 0.55, 1.0, 0, 0.42);
   }
 
-  public playImpact(intensity = 0.5): void {
+  public playImpact(intensity = 0.5, broadcast = true): void {
     const nowMs = performance.now();
     if (nowMs - this.lastImpactAt < 45) return;
     this.lastImpactAt = nowMs;
 
     const clamped = Math.min(Math.max(intensity, 0.12), 1);
+    if (broadcast && this.broadcaster && nowMs - this.lastImpactBroadcastAt >= 90) {
+      this.lastImpactBroadcastAt = nowMs;
+      this.broadcaster({ type: 'IMPACT', intensity: clamped });
+    }
+
     const rate = 0.88 + Math.random() * 0.28;
     this.playBuffer('wood_tap', clamped * 0.6, rate, 0, 0.25);
   }
 
-  public playCollapse(): void {
-    this.stopSlide();
+  public playCollapse(broadcast = true): void {
+    const nowMs = performance.now();
+    if (nowMs - this.lastCollapseAt < 1500) return;
+    this.lastCollapseAt = nowMs;
+
+    this.stopSlide(false);
+    if (broadcast && this.broadcaster) {
+      this.broadcaster({ type: 'COLLAPSE' });
+    }
     this.playBuffer('lego_break', 0.95, 1.0);
   }
 
-  public playExplosion(): void {
-    this.stopSlide();
+  public playExplosion(broadcast = true): void {
+    const nowMs = performance.now();
+    if (nowMs - this.lastExplosionAt < 1200) return;
+    this.lastExplosionAt = nowMs;
+
+    this.stopSlide(false);
+    if (broadcast && this.broadcaster) {
+      this.broadcaster({ type: 'EXPLOSION' });
+    }
     this.playBuffer('explosion', 0.95, 1.0);
     this.playBuffer('crash', 0.75, 0.92, 0.08);
   }

@@ -55,6 +55,8 @@ interface DragSession {
   committed: boolean;
   targetPlacement: PlacementSlot | null;
   alignedWithSlot: boolean;
+  hasClearedTop: boolean;
+  smoothedTargetPos: THREE.Vector3 | null;
   stagePoint: THREE.Vector3 | null;
   freePlacePos: Vec3 | null;
   yawSteps: number;
@@ -150,61 +152,93 @@ function resolveNonOverlappingPlacement(
   allowNudge: boolean
 ): { x: number; y: number; z: number } {
   const { hx, hy, hz } = getWorldHalfExtents(placedQuat);
-  let x = desiredX;
-  let z = desiredZ;
-  const gap = 0.04;
+  const gap = 0.06;
   const maxOffset = 2.25;
+  let x = THREE.MathUtils.clamp(desiredX, -maxOffset, maxOffset);
+  let z = THREE.MathUtils.clamp(desiredZ, -maxOffset, maxOffset);
 
-  // Separate horizontally from every block on the same top layer so blocks never overlap
-  if (allowNudge) {
-    const sameLayerBlocks = nearbyBlocks.filter(
-      (b) => Math.abs(b.y - baseSlotY) < BLOCK_HEIGHT * 0.9
-    );
+  const sameLayerBlocks = nearbyBlocks.filter(
+    (b) => b.y > baseSlotY - BLOCK_HEIGHT * 0.4
+  );
 
-    for (let pass = 0; pass < 3; pass++) {
-      for (const other of sameLayerBlocks) {
-        const reqX = hx + other.hx + gap;
-        const reqZ = hz + other.hz + gap;
-        const dx = x - other.x;
-        const dz = z - other.z;
-        const ox = reqX - Math.abs(dx);
-        const oz = reqZ - Math.abs(dz);
-
-        if (ox > 0 && oz > 0) {
-          if (ox <= oz) {
-            const primarySign = dx >= 0 ? 1 : -1;
-            const firstTry = other.x + primarySign * reqX;
-            const secondTry = other.x - primarySign * reqX;
-            if (Math.abs(firstTry) <= maxOffset) {
-              x = firstTry;
-            } else if (Math.abs(secondTry) <= maxOffset) {
-              x = secondTry;
-            }
-          } else {
-            const primarySign = dz >= 0 ? 1 : -1;
-            const firstTry = other.z + primarySign * reqZ;
-            const secondTry = other.z - primarySign * reqZ;
-            if (Math.abs(firstTry) <= maxOffset) {
-              z = firstTry;
-            } else if (Math.abs(secondTry) <= maxOffset) {
-              z = secondTry;
-            }
-          }
-        }
+  const hasHorizontalOverlap = (cx: number, cz: number): boolean => {
+    for (const other of sameLayerBlocks) {
+      const reqX = hx + other.hx + gap;
+      const reqZ = hz + other.hz + gap;
+      if (Math.abs(cx - other.x) < reqX && Math.abs(cz - other.z) < reqZ) {
+        return true;
       }
+    }
+    return false;
+  };
+
+  // Find closest non-overlapping (x, z) on the current layer without iterative ping-pong
+  if (allowNudge && sameLayerBlocks.length > 0 && hasHorizontalOverlap(x, z)) {
+    const candidates: Array<{ x: number; z: number }> = [];
+
+    for (const other of sameLayerBlocks) {
+      const reqX = hx + other.hx + gap;
+      const reqZ = hz + other.hz + gap;
+      candidates.push(
+        { x: other.x + reqX, z },
+        { x: other.x - reqX, z },
+        { x, z: other.z + reqZ },
+        { x, z: other.z - reqZ }
+      );
+    }
+
+    const xVals = [x, -1.5, 0, 1.5];
+    const zVals = [z, -1.5, 0, 1.5];
+    for (const other of sameLayerBlocks) {
+      const reqX = hx + other.hx + gap;
+      const reqZ = hz + other.hz + gap;
+      xVals.push(other.x + reqX, other.x - reqX);
+      zVals.push(other.z + reqZ, other.z - reqZ);
+    }
+    for (const cx of xVals) {
+      for (const cz of zVals) {
+        candidates.push({ x: cx, z: cz });
+      }
+    }
+
+    for (let gx = -2.1; gx <= 2.11; gx += 0.525) {
+      for (let gz = -2.1; gz <= 2.11; gz += 0.525) {
+        candidates.push({ x: gx, z: gz });
+      }
+    }
+
+    let bestDistSq = Infinity;
+    let bestX = x;
+    let bestZ = z;
+    let found = false;
+
+    for (const c of candidates) {
+      if (Math.abs(c.x) > maxOffset || Math.abs(c.z) > maxOffset) continue;
+      if (hasHorizontalOverlap(c.x, c.z)) continue;
+      const distSq = (c.x - x) * (c.x - x) + (c.z - z) * (c.z - z);
+      if (distSq < bestDistSq) {
+        bestDistSq = distSq;
+        bestX = c.x;
+        bestZ = c.z;
+        found = true;
+      }
+    }
+
+    if (found) {
+      x = bestX;
+      z = bestZ;
     }
   }
 
-  // Compute exact support surface Y beneath (x, z) so any vertical overlap stacks cleanly on top
+  // Compute exact support surface Y beneath (x, z); ignore minor settling jitter on the layer below
   let supportSurfaceY = Math.max(0, baseSlotY - BLOCK_HEIGHT / 2);
   for (const other of nearbyBlocks) {
+    const topY = other.y + other.hy;
+    if (topY <= baseSlotY - BLOCK_HEIGHT * 0.25) continue;
     const ox = hx + other.hx - Math.abs(x - other.x);
     const oz = hz + other.hz - Math.abs(z - other.z);
-    if (ox > 0.04 && oz > 0.04) {
-      const topY = other.y + other.hy;
-      if (topY > supportSurfaceY) {
-        supportSurfaceY = topY;
-      }
+    if (ox > 0.04 && oz > 0.04 && topY > supportSurfaceY) {
+      supportSurfaceY = topY;
     }
   }
 
@@ -359,48 +393,67 @@ function TowerPhysicsContent({
     soundEngine.stopSlide();
     gl.domElement.style.cursor = 'auto';
 
-    if (session.phase === 'PLACING' && session.targetPlacement && session.alignedWithSlot && body) {
-      const slot = session.targetPlacement;
-      const finalQuat = session.targetQuat.clone();
-      const dropPos: Vec3 = session.freePlacePos ?? [
-        slot.position[0],
-        slot.position[1] + getWorldHalfExtents(finalQuat).hy - BLOCK_HEIGHT / 2 + 0.05,
-        slot.position[2],
-      ];
+    if (session.phase === 'PLACING' && body) {
+      const cur = body.translation();
+      const radial = Math.hypot(cur.x, cur.z);
+      const canPlaceNow =
+        session.alignedWithSlot || (session.hasClearedTop && radial < 4.3);
+      const slot = session.targetPlacement ?? validTopSlots[0] ?? null;
 
-      // Release under full dynamic solid physics without teleporting inside neighbors
-      body.setLinvel({ x: 0, y: -0.4, z: 0 }, true);
-      body.setAngvel({ x: 0, y: 0, z: 0 }, true);
-      body.wakeUp();
+      if (canPlaceNow && slot) {
+        const finalQuat = session.targetQuat.clone();
+        const dropPos: Vec3 = session.freePlacePos ?? [
+          slot.position[0],
+          slot.position[1] + getWorldHalfExtents(finalQuat).hy - BLOCK_HEIGHT / 2 + 0.05,
+          slot.position[2],
+        ];
 
-      soundEngine.playPlace();
-      stashedOrientationRef.current = null;
-      setDragBlockId(null);
-      setStashedBlockId(null);
-
-      const resolvedLayer = Math.max(
-        slot.layer,
-        Math.round((dropPos[1] - BLOCK_HEIGHT / 2) / BLOCK_HEIGHT)
-      );
-
-      // Brief settle tick before emitting block:placed with current physical transform
-      placementDropTimeoutRef.current = window.setTimeout(() => {
-        const settledBody = bodyRefs.current.get(session.blockId);
-        const t = settledBody?.translation();
-        const r = settledBody?.rotation();
-        onPlaceBlock(
-          session.blockId,
+        // Settle straight onto the resolved non-overlapping pose on the top layer
+        body.setTranslation(
           {
-            position: t ? [t.x, t.y, t.z] : dropPos,
-            quaternion: r
-              ? [r.x, r.y, r.z, r.w]
-              : [finalQuat.x, finalQuat.y, finalQuat.z, finalQuat.w],
+            x: dropPos[0],
+            y: THREE.MathUtils.clamp(cur.y, dropPos[1] + 0.02, dropPos[1] + 0.12),
+            z: dropPos[2],
           },
-          resolvedLayer,
-          slot.slot
+          true
         );
-      }, 220);
-      return;
+        body.setRotation(
+          { x: finalQuat.x, y: finalQuat.y, z: finalQuat.z, w: finalQuat.w },
+          true
+        );
+        body.setLinvel({ x: 0, y: -0.45, z: 0 }, true);
+        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        body.wakeUp();
+
+        soundEngine.playPlace();
+        stashedOrientationRef.current = null;
+        setDragBlockId(null);
+        setStashedBlockId(null);
+
+        const resolvedLayer = Math.max(
+          slot.layer,
+          Math.round((dropPos[1] - BLOCK_HEIGHT / 2) / BLOCK_HEIGHT)
+        );
+
+        // Brief settle tick before emitting block:placed with current physical transform
+        placementDropTimeoutRef.current = window.setTimeout(() => {
+          const settledBody = bodyRefs.current.get(session.blockId);
+          const t = settledBody?.translation();
+          const r = settledBody?.rotation();
+          onPlaceBlock(
+            session.blockId,
+            {
+              position: t ? [t.x, t.y, t.z] : dropPos,
+              quaternion: r
+                ? [r.x, r.y, r.z, r.w]
+                : [finalQuat.x, finalQuat.y, finalQuat.z, finalQuat.w],
+            },
+            resolvedLayer,
+            slot.slot
+          );
+        }, 220);
+        return;
+      }
     }
 
     if (session.phase === 'PLACING') {
@@ -434,7 +487,7 @@ function TowerPhysicsContent({
       body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     }
     setDragBlockId(null);
-  }, [gl.domElement, onPlaceBlock]);
+  }, [gl.domElement, onPlaceBlock, validTopSlots]);
 
   useEffect(() => {
     const onWindowPointerUp = (e: PointerEvent) => {
@@ -569,6 +622,8 @@ function TowerPhysicsContent({
         committed: activeBlockId === blockId || isResumingStashed,
         targetPlacement: initialSlot,
         alignedWithSlot: false,
+        hasClearedTop: isResumingStashed,
+        smoothedTargetPos: null,
         stagePoint: initialStagePoint,
         freePlacePos: null,
         yawSteps,
@@ -705,6 +760,8 @@ function TowerPhysicsContent({
               session.yawSteps = targetSlot ? targetSlot.layer % 2 : 0;
               session.isOnSide = false;
               session.hasCustomRotation = false;
+              session.hasClearedTop = false;
+              session.smoothedTargetPos = null;
               session.targetQuat.copy(
                 buildPlacementQuaternion(session.yawSteps, session.isOnSide)
               );
@@ -746,13 +803,16 @@ function TowerPhysicsContent({
             }
 
             const cur = body.translation();
-            const clearedTopHeight = cur.y >= topY - 0.15;
             const radial = Math.hypot(cur.x, cur.z);
             const radialFromCenter = Math.hypot(hitPoint.x, hitPoint.z);
 
-            const aligned = clearedTopHeight
-              ? Boolean(chosenSlot && radialFromCenter < 3.5)
-              : false;
+            // Latch top clearance once lifted cleanly so hovering never oscillates up/down
+            if (!session.hasClearedTop && (cur.y >= baseSlotY - 0.15 || radial <= 4.0)) {
+              session.hasClearedTop = true;
+            }
+
+            const aligned =
+              session.hasClearedTop && Boolean(chosenSlot && radialFromCenter < 4.2);
 
             session.alignedWithSlot = aligned;
 
@@ -760,7 +820,7 @@ function TowerPhysicsContent({
             let targetZ: number;
             let targetY: number;
 
-            if (!clearedTopHeight && radial > 3.6 && session.stagePoint) {
+            if (!session.hasClearedTop && radial > 3.6 && session.stagePoint) {
               // Lift straight up outside the tower in open air before moving inward over the top
               targetX = session.stagePoint.x;
               targetZ = session.stagePoint.z;
@@ -802,7 +862,7 @@ function TowerPhysicsContent({
 
               targetX = resolved.x;
               targetZ = resolved.z;
-              targetY = resolved.y + 0.18;
+              targetY = resolved.y + 0.36;
               session.freePlacePos = [resolved.x, resolved.y, resolved.z];
             } else {
               targetX = THREE.MathUtils.clamp(hitPoint.x, -9, 9);
@@ -811,7 +871,24 @@ function TowerPhysicsContent({
               session.freePlacePos = null;
             }
 
-            driveBodyTowardPose(body, targetX, targetY, targetZ, session.targetQuat, 14);
+            if (!session.smoothedTargetPos) {
+              session.smoothedTargetPos = new THREE.Vector3(targetX, targetY, targetZ);
+            } else {
+              const smoothAlpha = 1 - Math.exp(-26 * Math.min(delta, 0.05));
+              session.smoothedTargetPos.lerp(
+                tempVecB.set(targetX, targetY, targetZ),
+                smoothAlpha
+              );
+            }
+
+            driveBodyTowardPose(
+              body,
+              session.smoothedTargetPos.x,
+              session.smoothedTargetPos.y,
+              session.smoothedTargetPos.z,
+              session.targetQuat,
+              14
+            );
           }
         }
       }

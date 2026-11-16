@@ -1,5 +1,6 @@
 import { createClient, RealtimeChannel, SupabaseClient } from '@supabase/supabase-js';
 import { customAlphabet, nanoid } from 'nanoid';
+import { GlobalSoundEvent } from '../audio/soundEngine';
 import {
   ChatMessage,
   cloneBlocks,
@@ -37,6 +38,7 @@ export interface SupabaseRoomCallbacks {
   onPhysicsState: (blocks: CompactBlockTuple[]) => void;
   onBlockHovered: (payload: { blockId: number | null; playerId: string }) => void;
   onBlockGrabbed: (payload: { blockId: number; playerId: string; committed: boolean }) => void;
+  onSoundEvent: (event: GlobalSoundEvent) => void;
   onChatMessage: (message: ChatMessage) => void;
   onError: (message: string) => void;
 }
@@ -518,6 +520,11 @@ class SupabaseRoomController {
           this.callbacks?.onChatMessage(payload as ChatMessage);
         }
       })
+      .on('broadcast', { event: 'sfx:event' }, ({ payload }) => {
+        if (payload) {
+          this.callbacks?.onSoundEvent(payload as GlobalSoundEvent);
+        }
+      })
       .on(
         'postgres_changes',
         {
@@ -919,6 +926,15 @@ class SupabaseRoomController {
       type: 'broadcast',
       event: 'block:hovered',
       payload: { blockId, playerId: this.clientId },
+    });
+  }
+
+  public broadcastSound(event: GlobalSoundEvent): void {
+    if (!this.channel || !this.roomState) return;
+    void this.channel.send({
+      type: 'broadcast',
+      event: 'sfx:event',
+      payload: event,
     });
   }
 

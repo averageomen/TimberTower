@@ -110,6 +110,8 @@ export default function App() {
   const reactionTimeoutRef = useRef<number | null>(null);
   const prevTurnMarkerRef = useRef<string | null>(null);
   const lastExplosionAtRef = useRef<number | null>(null);
+  const prevMovesStateRef = useRef<{ roomId: string; moves: number } | null>(null);
+  const prevCollapseGameOverRef = useRef<string | null>(null);
   const latestLocalSimTransformsRef = useRef<Map<number, { position: Vec3; quaternion: Quat }>>(
     new Map()
   );
@@ -186,6 +188,9 @@ export default function App() {
       onBlockGrabbed: (payload) => {
         setRemoteGrabbedBlockId(payload.blockId);
       },
+      onSoundEvent: (event) => {
+        soundEngine.playRemoteEvent(event);
+      },
       onChatMessage: (msg) => {
         setChatMessages((prev) => [...prev.slice(-60), msg]);
         if (!msg.system && msg.emoji && !msg.message) {
@@ -197,7 +202,12 @@ export default function App() {
       },
     });
 
+    soundEngine.setBroadcaster((event) => {
+      supabaseMultiplayer.broadcastSound(event);
+    });
+
     return () => {
+      soundEngine.setBroadcaster(null);
       void supabaseMultiplayer.leaveRoom();
     };
   }, [showFloatingEmoji]);
@@ -222,14 +232,51 @@ export default function App() {
     }
   }, [activeRoomState]);
 
-  // Trigger explosion audio when a player is eliminated in Elimination Tower mode
+  // Trigger explosion & Lego collapse audio when a player is eliminated in Elimination Tower mode
   useEffect(() => {
     const eliminatedAt = activeRoomState?.lastEliminatedAt ?? null;
     if (eliminatedAt && eliminatedAt !== lastExplosionAtRef.current) {
       lastExplosionAtRef.current = eliminatedAt;
-      soundEngine.playExplosion();
+      soundEngine.playCollapse(false);
+      soundEngine.playExplosion(false);
     }
   }, [activeRoomState?.lastEliminatedAt]);
+
+  // State-sync fallback for global tower collapse and block placement audio across all clients
+  useEffect(() => {
+    if (!activeRoomState) {
+      prevMovesStateRef.current = null;
+      prevCollapseGameOverRef.current = null;
+      return;
+    }
+
+    const prevMoves = prevMovesStateRef.current;
+    if (
+      prevMoves &&
+      prevMoves.roomId === activeRoomState.roomId &&
+      activeRoomState.blocksMovedCount > prevMoves.moves &&
+      activeRoomState.blocksMovedCount > 0
+    ) {
+      soundEngine.playPlace(false);
+    }
+    prevMovesStateRef.current = {
+      roomId: activeRoomState.roomId,
+      moves: activeRoomState.blocksMovedCount,
+    };
+
+    if (
+      activeRoomState.status === 'GAME_OVER' &&
+      activeRoomState.gameOverReason === 'TOWER_COLLAPSED'
+    ) {
+      const marker = `${activeRoomState.roomId}-${activeRoomState.blocksMovedCount}-${activeRoomState.towerRestoreVersion}-${activeRoomState.turnStartedAt}`;
+      if (prevCollapseGameOverRef.current !== marker) {
+        prevCollapseGameOverRef.current = marker;
+        soundEngine.playCollapse(false);
+      }
+    } else {
+      prevCollapseGameOverRef.current = null;
+    }
+  }, [activeRoomState]);
 
   // Turn audio chime when turn shifts to user
   useEffect(() => {
