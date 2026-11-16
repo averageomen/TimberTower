@@ -25,6 +25,7 @@ interface JengaTowerProps {
   blocks: BlockState[];
   status: RoomStatus;
   isMyTurn: boolean;
+  blocksMovedCount: number;
   activeBlockId: number | null;
   remoteHoveredBlockId: number | null;
   remoteGrabbedBlockId: number | null;
@@ -55,6 +56,8 @@ interface DragSession {
   committed: boolean;
   targetPlacement: PlacementSlot | null;
   alignedWithSlot: boolean;
+  stagePoint: THREE.Vector3 | null;
+  freePlacePos: Vec3 | null;
 }
 
 function GhostPlacementGuides({
@@ -114,6 +117,7 @@ function TowerPhysicsContent({
   blocks,
   status,
   isMyTurn,
+  blocksMovedCount,
   activeBlockId,
   remoteHoveredBlockId,
   remoteGrabbedBlockId,
@@ -253,7 +257,11 @@ function TowerPhysicsContent({
 
     if (session.phase === 'PLACING' && session.targetPlacement && session.alignedWithSlot && body) {
       const slot = session.targetPlacement;
-      const dropPos: Vec3 = [slot.position[0], slot.position[1] + 0.06, slot.position[2]];
+      const dropPos: Vec3 = session.freePlacePos ?? [
+        slot.position[0],
+        slot.position[1] + 0.06,
+        slot.position[2],
+      ];
       body.setTranslation({ x: dropPos[0], y: dropPos[1], z: dropPos[2] }, true);
       body.setRotation(
         {
@@ -281,7 +289,7 @@ function TowerPhysicsContent({
         onPlaceBlock(
           session.blockId,
           {
-            position: t ? [t.x, t.y, t.z] : slot.position,
+            position: t ? [t.x, t.y, t.z] : dropPos,
             quaternion: r ? [r.x, r.y, r.z, r.w] : slot.quaternion,
           },
           slot.layer,
@@ -292,7 +300,16 @@ function TowerPhysicsContent({
     }
 
     if (session.phase === 'PLACING') {
-      // Released outside the top ghost slot: keep held safely at staging height so user can orbit & finish stacking
+      // Released outside the top slot: park safely outside & above the tower so user can orbit & finish stacking
+      if (body && session.stagePoint) {
+        const topY = (validTopSlots[0]?.position[1] ?? 9.25) + 0.85;
+        const cur = body.translation();
+        const radial = Math.hypot(cur.x, cur.z);
+        const safeX = radial < 5.2 ? session.stagePoint.x : cur.x;
+        const safeZ = radial < 5.2 ? session.stagePoint.z : cur.z;
+        const safeY = Math.max(cur.y, topY);
+        body.setNextKinematicTranslation({ x: safeX, y: safeY, z: safeZ });
+      }
       setStashedBlockId(session.blockId);
       setDragBlockId(null);
       setDragPhase('IDLE');
@@ -377,6 +394,14 @@ function TowerPhysicsContent({
 
       const initialPhase: DragPhase = isResumingStashed ? 'PLACING' : 'PULLING';
       const initialSlot = validTopSlots[0] ?? null;
+      const stageRadial = Math.hypot(blockPos.x, blockPos.z);
+      const initialStagePoint = isResumingStashed
+        ? new THREE.Vector3(
+            stageRadial >= 5.2 ? blockPos.x : pullAxis.x * 6.2,
+            blockPos.y,
+            stageRadial >= 5.2 ? blockPos.z : pullAxis.z * 6.2
+          )
+        : null;
 
       dragSessionRef.current = {
         blockId,
@@ -388,6 +413,8 @@ function TowerPhysicsContent({
         committed: activeBlockId === blockId || isResumingStashed,
         targetPlacement: initialSlot,
         alignedWithSlot: false,
+        stagePoint: initialStagePoint,
+        freePlacePos: null,
       };
 
       setDragBlockId(blockId);
@@ -499,9 +526,20 @@ function TowerPhysicsContent({
               onGrabBlock(session.blockId, true);
             }
 
-            // Transition to PLACING once extracted clear of the 4.5-unit tower footprint
-            const radialDist = Math.hypot(cur.x, cur.z);
-            if (radialDist > 4.65) {
+            // Transition to PLACING only once the entire 4.5-unit brick is pulled completely clear of the tower
+            const axisDist = cur.x * session.pullAxis.x + cur.z * session.pullAxis.z;
+            if (Math.abs(axisDist) > 5.35) {
+              const dirSign = axisDist >= 0 ? 1 : -1;
+              const lateralOffset = session.startBlockPos
+                .clone()
+                .addScaledVector(
+                  session.pullAxis,
+                  -session.startBlockPos.dot(session.pullAxis)
+                );
+              session.stagePoint = lateralOffset.addScaledVector(
+                session.pullAxis,
+                dirSign * 6.2
+              );
               session.phase = 'PLACING';
               session.committed = true;
               session.targetPlacement = validTopSlots[0] ?? null;
@@ -538,17 +576,47 @@ function TowerPhysicsContent({
               setActiveTargetSlot(chosenSlot);
             }
 
+            const cur = body.translation();
+            const showGuides = blocksMovedCount < 5;
+            const clearedTopHeight = cur.y >= topY - 0.35;
             const radialFromCenter = Math.hypot(hitPoint.x, hitPoint.z);
-            const aligned = Boolean(chosenSlot && radialFromCenter < 3.4 && bestDist < 2.25);
+
+            const aligned = clearedTopHeight
+              ? showGuides
+                ? Boolean(chosenSlot && radialFromCenter < 3.4 && bestDist < 2.25)
+                : Boolean(chosenSlot && radialFromCenter < 3.5)
+              : false;
+
             session.alignedWithSlot = aligned;
             setIsAlignedWithSlot(aligned);
 
-            const targetX = aligned && chosenSlot ? chosenSlot.position[0] : THREE.MathUtils.clamp(hitPoint.x, -9, 9);
-            const targetZ = aligned && chosenSlot ? chosenSlot.position[2] : THREE.MathUtils.clamp(hitPoint.z, -9, 9);
-            const targetY =
-              aligned && chosenSlot ? chosenSlot.position[1] + 0.24 : topY + 0.55;
+            let targetX: number;
+            let targetZ: number;
+            let targetY: number;
 
-            const cur = body.translation();
+            if (!clearedTopHeight && session.stagePoint) {
+              // Lift straight up outside the tower first before gliding over the top
+              targetX = session.stagePoint.x;
+              targetZ = session.stagePoint.z;
+              targetY = topY + 0.55;
+              session.freePlacePos = null;
+            } else if (aligned && chosenSlot && showGuides) {
+              targetX = chosenSlot.position[0];
+              targetZ = chosenSlot.position[2];
+              targetY = chosenSlot.position[1] + 0.24;
+              session.freePlacePos = null;
+            } else if (aligned && chosenSlot && !showGuides) {
+              targetX = THREE.MathUtils.clamp(hitPoint.x, -2.5, 2.5);
+              targetZ = THREE.MathUtils.clamp(hitPoint.z, -2.5, 2.5);
+              targetY = chosenSlot.position[1] + 0.24;
+              session.freePlacePos = [targetX, chosenSlot.position[1] + 0.06, targetZ];
+            } else {
+              targetX = THREE.MathUtils.clamp(hitPoint.x, -9, 9);
+              targetZ = THREE.MathUtils.clamp(hitPoint.z, -9, 9);
+              targetY = topY + 0.55;
+              session.freePlacePos = null;
+            }
+
             const smoothFactor = 1 - Math.exp(-16 * delta);
             const nextPos = {
               x: THREE.MathUtils.lerp(cur.x, targetX, smoothFactor),
@@ -699,6 +767,7 @@ function TowerPhysicsContent({
             key={`${matchResetVersion}-${block.id}`}
             block={block}
             isDynamic={blockDynamic}
+            isSensor={isHeldKinematic}
             isHovered={isLegalHover}
             isRemoteHovered={!isMyTurn && remoteHoveredBlockId === block.id}
             isIllegalHover={isIllegalHover}
@@ -716,13 +785,16 @@ function TowerPhysicsContent({
         );
       })}
 
-      {(dragPhase === 'PLACING' || stashedBlockId !== null) && isMyTurn && status === 'PLAYING' && (
-        <GhostPlacementGuides
-          slots={validTopSlots}
-          activeSlot={activeTargetSlot ?? validTopSlots[0] ?? null}
-          isAligned={isAlignedWithSlot}
-        />
-      )}
+      {blocksMovedCount < 5 &&
+        (dragPhase === 'PLACING' || stashedBlockId !== null) &&
+        isMyTurn &&
+        status === 'PLAYING' && (
+          <GhostPlacementGuides
+            slots={validTopSlots}
+            activeSlot={activeTargetSlot ?? validTopSlots[0] ?? null}
+            isAligned={isAlignedWithSlot}
+          />
+        )}
     </>
   );
 }

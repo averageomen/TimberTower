@@ -13,6 +13,7 @@ import { getBlockTintColor, getBlockWoodMaps } from '../utils/woodTexture';
 interface JengaBlockProps {
   block: BlockState;
   isDynamic: boolean;
+  isSensor?: boolean;
   isHovered: boolean;
   isRemoteHovered: boolean;
   isIllegalHover: boolean;
@@ -28,6 +29,7 @@ interface JengaBlockProps {
 export function JengaBlock({
   block,
   isDynamic,
+  isSensor = false,
   isHovered,
   isRemoteHovered,
   isIllegalHover,
@@ -89,6 +91,7 @@ export function JengaBlock({
         args={[BLOCK_WIDTH / 2, BLOCK_HEIGHT / 2, BLOCK_LENGTH / 2]}
         friction={0.65}
         restitution={0.05}
+        sensor={isSensor}
       />
 
       <RoundedBox
