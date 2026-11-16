@@ -100,6 +100,7 @@ export default function App() {
   const [matchResetVersion, setMatchResetVersion] = useState(1);
   const [cameraResetTrigger, setCameraResetTrigger] = useState(0);
   const [muted, setMuted] = useState(false);
+  const [emoteMuted, setEmoteMuted] = useState(false);
 
   const remotePhysicsFrames = useRef<
     Map<number, { pos: THREE.Vector3; quat: THREE.Quaternion }>
@@ -138,6 +139,7 @@ export default function App() {
   }, []);
 
   const showFloatingEmoji = useCallback((id: string, emoji: string, sender: string) => {
+    soundEngine.playEmote(emoji);
     const jitterX = (Math.random() - 0.5) * 14;
     setFloatingReactions((prev) => [...prev.slice(-11), { id, emoji, sender, jitterX }]);
     const timer = window.setTimeout(() => {
@@ -703,6 +705,14 @@ export default function App() {
     });
   }, []);
 
+  const handleToggleEmoteMute = useCallback(() => {
+    setEmoteMuted((prev) => {
+      const next = !prev;
+      soundEngine.setEmoteSoundsMuted(next);
+      return next;
+    });
+  }, []);
+
   const showcaseBlocks = useMemo(() => createInitialBlocks(), []);
   const sceneBlocks = activeRoomState ? activeRoomState.blocks : showcaseBlocks;
   const sceneStatus = activeRoomState ? activeRoomState.status : 'WAITING';
@@ -775,7 +785,9 @@ export default function App() {
           chatMessages={chatMessages}
           floatingReactions={floatingReactions}
           muted={muted}
+          emoteMuted={emoteMuted}
           onToggleMute={handleToggleMute}
+          onToggleEmoteMute={handleToggleEmoteMute}
           onResetCamera={() => setCameraResetTrigger((v) => v + 1)}
           onSendChat={handleSendChat}
           onRematch={handleRematch}

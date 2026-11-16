@@ -35,7 +35,9 @@ interface GameHUDProps {
     jitterX: number;
   }>;
   muted: boolean;
+  emoteMuted: boolean;
   onToggleMute: () => void;
+  onToggleEmoteMute: () => void;
   onResetCamera: () => void;
   onSendChat: (message: string, emoji?: string) => void;
   onRematch: () => void;
@@ -51,7 +53,9 @@ export function GameHUD({
   chatMessages,
   floatingReactions,
   muted,
+  emoteMuted,
   onToggleMute,
+  onToggleEmoteMute,
   onResetCamera,
   onSendChat,
   onRematch,
@@ -383,38 +387,59 @@ export function GameHUD({
 
       {/* Bottom Row: Emoji Reactions & Chat Panel */}
       <div className="flex items-end justify-between gap-4">
-        {/* Quick Reaction Bar with bottom-left floating icons */}
-        <div className="relative pointer-events-auto flex items-center gap-1.5 rounded-2xl border border-stone-700/80 bg-stone-900/85 px-2.5 py-1.5 shadow-lg backdrop-blur-md">
-          {QUICK_EMOJIS.map((emoji, idx) => (
-            <div key={emoji} className="relative flex items-center justify-center">
-              <div className="pointer-events-none absolute bottom-full left-1/2 mb-1 -translate-x-1/2">
-                {floatingReactions
-                  .filter(
-                    (r) =>
-                      r.emoji === emoji ||
-                      (idx === 0 && !QUICK_EMOJIS.includes(r.emoji))
-                  )
-                  .map((reaction) => (
-                    <div
-                      key={reaction.id}
-                      style={{ marginLeft: `${reaction.jitterX}px` }}
-                      className="absolute bottom-0 left-1/2 -translate-x-1/2"
-                    >
-                      <div className="animate-emoji-float select-none text-2xl drop-shadow-[0_2px_6px_rgba(0,0,0,0.85)]">
-                        {reaction.emoji}
+        <div className="pointer-events-auto flex items-center gap-2">
+          {/* Quick Reaction Bar with bottom-left floating icons */}
+          <div className="relative flex items-center gap-1.5 rounded-2xl border border-stone-700/80 bg-stone-900/85 px-2.5 py-1.5 shadow-lg backdrop-blur-md">
+            {QUICK_EMOJIS.map((emoji, idx) => (
+              <div key={emoji} className="relative flex items-center justify-center">
+                <div className="pointer-events-none absolute bottom-full left-1/2 mb-1 -translate-x-1/2">
+                  {floatingReactions
+                    .filter(
+                      (r) =>
+                        r.emoji === emoji ||
+                        (idx === 0 && !QUICK_EMOJIS.includes(r.emoji))
+                    )
+                    .map((reaction) => (
+                      <div
+                        key={reaction.id}
+                        style={{ marginLeft: `${reaction.jitterX}px` }}
+                        className="absolute bottom-0 left-1/2 -translate-x-1/2"
+                      >
+                        <div className="animate-emoji-float select-none text-2xl drop-shadow-[0_2px_6px_rgba(0,0,0,0.85)]">
+                          {reaction.emoji}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    ))}
+                </div>
+                <button
+                  onClick={() => onSendChat('', emoji)}
+                  className="rounded-xl px-2 py-1 text-lg transition hover:scale-125 hover:bg-stone-800"
+                  title={`React ${emoji}`}
+                >
+                  {emoji}
+                </button>
               </div>
-              <button
-                onClick={() => onSendChat('', emoji)}
-                className="rounded-xl px-2 py-1 text-lg transition hover:scale-125 hover:bg-stone-800"
-                title={`React ${emoji}`}
-              >
-                {emoji}
-              </button>
-            </div>
-          ))}
+            ))}
+          </div>
+
+          <button
+            type="button"
+            onClick={onToggleEmoteMute}
+            title={emoteMuted ? 'Turn emote sounds on' : 'Turn emote sounds off'}
+            aria-label={emoteMuted ? 'Unmute emote sounds' : 'Mute emote sounds'}
+            className={`flex items-center gap-1.5 rounded-2xl border px-3 py-2 text-xs font-semibold shadow-lg backdrop-blur-md transition hover:brightness-110 ${
+              emoteMuted
+                ? 'border-red-500/40 bg-red-950/75 text-red-200'
+                : 'border-stone-700/80 bg-stone-900/85 text-amber-200 hover:bg-stone-800'
+            }`}
+          >
+            {emoteMuted ? (
+              <VolumeX className="h-4 w-4 text-red-300" />
+            ) : (
+              <Volume2 className="h-4 w-4 text-amber-300" />
+            )}
+            <span>{emoteMuted ? 'Emotes Muted' : 'Emote SFX'}</span>
+          </button>
         </div>
 
         {/* Chat Drawer */}

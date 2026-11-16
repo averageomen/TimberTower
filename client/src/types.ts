@@ -134,29 +134,6 @@ export function cloneBlocks(blocks: BlockState[]): BlockState[] {
   }));
 }
 
-function getLevelBlockQuaternion(quat: Quat): Quat {
-  const [qx, qy, qz, qw] = quat;
-  // Local Z axis projected onto horizontal XZ plane determines 90-deg yaw step
-  const zx = 2 * (qx * qz + qw * qy);
-  const zz = 1 - 2 * (qx * qx + qy * qy);
-  const yawAngle = Math.atan2(zx, zz);
-  const yawStep = ((Math.round(yawAngle / (Math.PI / 2)) % 4) + 4) % 4;
-  const halfYaw = (yawStep * (Math.PI / 2)) / 2;
-  const s = Math.sin(halfYaw);
-  const c = Math.cos(halfYaw);
-
-  // Local Y axis Y component tells whether block rests flat vs on its narrow side
-  const yy = 1 - 2 * (qx * qx + qz * qz);
-  const isOnSide = Math.abs(yy) < 0.5;
-
-  if (!isOnSide) {
-    return [0, s, 0, c];
-  }
-
-  const h = Math.SQRT1_2;
-  return [s * h, s * h, c * h, c * h];
-}
-
 export function sanitizeStableBlocks(
   candidateBlocks: BlockState[],
   fallbackSafeBlocks: BlockState[]
@@ -206,13 +183,11 @@ export function sanitizeStableBlocks(
     }
 
     const expectedFlatY = BLOCK_HEIGHT / 2 + b.layer * BLOCK_HEIGHT;
-    const longAxisY = Math.abs(2 * (qy * qz - qw * qx));
     const isUnsafe =
-      Math.abs(x) > 2.3 ||
-      Math.abs(z) > 2.3 ||
-      y < expectedFlatY - 0.16 ||
-      y > expectedFlatY + 0.85 ||
-      longAxisY > 0.15;
+      Math.abs(x) > 2.65 ||
+      Math.abs(z) > 2.65 ||
+      y < Math.max(0.15, expectedFlatY - 1.2) ||
+      y > expectedFlatY + 1.5;
 
     if (isUnsafe) {
       unsafeCount++;
@@ -225,25 +200,18 @@ export function sanitizeStableBlocks(
   }
 
   return candidateBlocks.map((b, idx) => {
-    if (b.isRemoved) {
-      return {
-        ...b,
-        position: [b.position[0], b.position[1], b.position[2]],
-        quaternion: [
-          b.quaternion[0],
-          b.quaternion[1],
-          b.quaternion[2],
-          b.quaternion[3],
-        ],
-      };
-    }
-    if (unsafeFlags[idx]) {
+    if (unsafeFlags[idx] && !b.isRemoved) {
       return getFallbackFor(b);
     }
     return {
       ...b,
       position: [b.position[0], b.position[1], b.position[2]],
-      quaternion: getLevelBlockQuaternion(b.quaternion),
+      quaternion: [
+        b.quaternion[0],
+        b.quaternion[1],
+        b.quaternion[2],
+        b.quaternion[3],
+      ],
     };
   });
 }

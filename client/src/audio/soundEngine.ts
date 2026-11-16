@@ -17,7 +17,13 @@ type SoundKey =
   | 'crash'
   | 'explosion'
   | 'turn_chime'
-  | 'tick';
+  | 'tick'
+  | 'emote_fire'
+  | 'emote_clap'
+  | 'emote_shock'
+  | 'emote_wood'
+  | 'emote_laugh'
+  | 'emote_boom';
 
 const SOUND_SOURCES: Record<SoundKey, { local: string; remote: string }> = {
   wood_tap: {
@@ -52,6 +58,39 @@ const SOUND_SOURCES: Record<SoundKey, { local: string; remote: string }> = {
     local: './sounds/tick.ogg',
     remote: 'https://actions.google.com/sounds/v1/alarms/beep_short.ogg',
   },
+  emote_fire: {
+    local: './sounds/emote_fire.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/faaah.mp3',
+  },
+  emote_clap: {
+    local: './sounds/emote_clap.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/claps-with-cheers-audience.mp3',
+  },
+  emote_shock: {
+    local: './sounds/emote_shock.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/huh-cat-meme.mp3',
+  },
+  emote_wood: {
+    local: './sounds/emote_wood.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/bonk_7zPAD7C.mp3',
+  },
+  emote_laugh: {
+    local: './sounds/emote_laugh.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/cat-laugh-meme-1.mp3',
+  },
+  emote_boom: {
+    local: './sounds/emote_boom.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/vine-boom-sound-meme.mp3',
+  },
+};
+
+const EMOTE_SOUND_MAP: Record<string, SoundKey> = {
+  '🔥': 'emote_fire',
+  '👏': 'emote_clap',
+  '😱': 'emote_shock',
+  '🪵': 'emote_wood',
+  '😂': 'emote_laugh',
+  '💥': 'emote_boom',
 };
 
 const MUSIC_SOURCES: Record<Exclude<MusicTrack, 'NONE'>, { local: string; remote: string }> = {
@@ -74,6 +113,7 @@ const MUSIC_VOLUME = 0.22;
 class SoundEngine {
   private ctx: AudioContext | null = null;
   private muted = false;
+  private emoteSoundsMuted = false;
   private buffers = new Map<SoundKey, AudioBuffer>();
   private loadingPromise: Promise<void> | null = null;
 
@@ -334,6 +374,21 @@ class SoundEngine {
 
   public isMuted(): boolean {
     return this.muted;
+  }
+
+  public setEmoteSoundsMuted(muted: boolean): void {
+    this.emoteSoundsMuted = muted;
+  }
+
+  public isEmoteSoundsMuted(): boolean {
+    return this.emoteSoundsMuted;
+  }
+
+  public playEmote(emoji: string): void {
+    if (this.muted || this.emoteSoundsMuted) return;
+    const key = EMOTE_SOUND_MAP[emoji];
+    if (!key) return;
+    this.playBuffer(key, 0.72, 1.0);
   }
 
   public updateSlide(speed: number, broadcast = true): void {

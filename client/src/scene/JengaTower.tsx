@@ -300,8 +300,11 @@ function TowerPhysicsContent({
 
   const tempVecA = useMemo(() => new THREE.Vector3(), []);
   const tempVecB = useMemo(() => new THREE.Vector3(), []);
+  const tempCamForward = useMemo(() => new THREE.Vector3(), []);
+  const tempCamRight = useMemo(() => new THREE.Vector3(), []);
   const tempQuatA = useMemo(() => new THREE.Quaternion(), []);
   const tempQuatB = useMemo(() => new THREE.Quaternion(), []);
+  const keysPressedRef = useRef<Set<string>>(new Set());
   const defaultTarget = useMemo<[number, number, number]>(() => [0, 4.5, 0], []);
 
   const isLocalSimulator = isMyTurn && (status === 'PLAYING' || status === 'SETTLING');
@@ -534,16 +537,27 @@ function TowerPhysicsContent({
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (e.key === 'r' || e.key === 'R') {
+      const lower = e.key.toLowerCase();
+      if (lower === 'w' || lower === 'a' || lower === 's' || lower === 'd') {
+        keysPressedRef.current.add(lower);
+      } else if (lower === 'r') {
         rotateActiveSession('YAW');
-      } else if (e.key === 'f' || e.key === 'F') {
+      } else if (lower === 'f') {
         rotateActiveSession('SIDE');
       }
     };
 
+    const onKeyUp = (e: KeyboardEvent) => {
+      keysPressedRef.current.delete(e.key.toLowerCase());
+    };
+
+    const onWindowBlur = () => {
+      keysPressedRef.current.clear();
+    };
+
     const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
       if (dragSessionRef.current?.phase === 'PLACING') {
-        e.preventDefault();
         rotateActiveSession('YAW');
       }
     };
@@ -551,11 +565,15 @@ function TowerPhysicsContent({
     window.addEventListener('pointerup', onWindowPointerUp);
     window.addEventListener('pointercancel', onWindowPointerUp);
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onWindowBlur);
     gl.domElement.addEventListener('contextmenu', onContextMenu);
     return () => {
       window.removeEventListener('pointerup', onWindowPointerUp);
       window.removeEventListener('pointercancel', onWindowPointerUp);
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onWindowBlur);
       gl.domElement.removeEventListener('contextmenu', onContextMenu);
     };
   }, [finishRelease, gl.domElement]);
@@ -982,23 +1000,12 @@ function TowerPhysicsContent({
 
         const t = body.translation();
         const nominalY = BLOCK_HEIGHT / 2 + block.layer * BLOCK_HEIGHT;
+        const radial = Math.hypot(t.x, t.z);
         if (
           t.y < -0.25 ||
           (block.layer > 0 && t.y < BLOCK_HEIGHT * 0.68) ||
-          t.y < nominalY - 1.1
+          (radial > 2.8 && t.y < nominalY - 1.6)
         ) {
-          triggerCollapseOnce();
-          break;
-        }
-
-        // Check severe longitudinal tilt (> ~42 deg from horizontal) indicating structural collapse;
-        // keeps blocks intentionally placed sideways on their narrow edge valid.
-        const r = body.rotation();
-        tempQuatA.set(r.x, r.y, r.z, r.w);
-        const longAxisY = Math.abs(
-          tempVecB.set(0, 0, 1).applyQuaternion(tempQuatA).y
-        );
-        if (longAxisY > 0.67) {
           triggerCollapseOnce();
           break;
         }
@@ -1057,6 +1064,62 @@ function TowerPhysicsContent({
         });
       }
     }
+
+    // 5. WASD camera movement & strict room bounds
+    const controls = controlsRef.current;
+    if (controls) {
+      const keys = keysPressedRef.current;
+      const forwardInput = (keys.has('w') ? 1 : 0) - (keys.has('s') ? 1 : 0);
+      const strafeInput = (keys.has('d') ? 1 : 0) - (keys.has('a') ? 1 : 0);
+
+      if (forwardInput !== 0 || strafeInput !== 0) {
+        camera.getWorldDirection(tempCamForward);
+        tempCamForward.y = 0;
+        if (tempCamForward.lengthSq() > 1e-6) {
+          tempCamForward.normalize();
+        } else {
+          tempCamForward.set(0, 0, -1);
+        }
+        tempCamRight.set(-tempCamForward.z, 0, tempCamForward.x);
+
+        const dx = tempCamForward.x * forwardInput + tempCamRight.x * strafeInput;
+        const dz = tempCamForward.z * forwardInput + tempCamRight.z * strafeInput;
+        const len = Math.hypot(dx, dz);
+
+        if (len > 1e-6) {
+          const step = 14 * Math.min(delta, 0.05);
+          const moveX = (dx / len) * step;
+          const moveZ = (dz / len) * step;
+
+          const minMoveX = Math.max(-29.5 - camera.position.x, -18 - controls.target.x);
+          const maxMoveX = Math.min(29.5 - camera.position.x, 18 - controls.target.x);
+          const clampedMoveX =
+            minMoveX <= maxMoveX
+              ? THREE.MathUtils.clamp(moveX, minMoveX, maxMoveX)
+              : 0;
+
+          const minMoveZ = Math.max(-29.5 - camera.position.z, -18 - controls.target.z);
+          const maxMoveZ = Math.min(29.5 - camera.position.z, 18 - controls.target.z);
+          const clampedMoveZ =
+            minMoveZ <= maxMoveZ
+              ? THREE.MathUtils.clamp(moveZ, minMoveZ, maxMoveZ)
+              : 0;
+
+          camera.position.x += clampedMoveX;
+          camera.position.z += clampedMoveZ;
+          controls.target.x += clampedMoveX;
+          controls.target.z += clampedMoveZ;
+        }
+      }
+
+      controls.target.x = THREE.MathUtils.clamp(controls.target.x, -18, 18);
+      controls.target.y = THREE.MathUtils.clamp(controls.target.y, 0.5, 16);
+      controls.target.z = THREE.MathUtils.clamp(controls.target.z, -18, 18);
+
+      camera.position.x = THREE.MathUtils.clamp(camera.position.x, -29.5, 29.5);
+      camera.position.y = THREE.MathUtils.clamp(camera.position.y, 0.6, 22);
+      camera.position.z = THREE.MathUtils.clamp(camera.position.z, -29.5, 29.5);
+    }
   });
 
   return (
@@ -1065,6 +1128,8 @@ function TowerPhysicsContent({
         ref={controlsRef}
         makeDefault
         enabled={orbitEnabled}
+        enablePan={false}
+        mouseButtons={{ LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY }}
         enableDamping
         dampingFactor={0.07}
         target={defaultTarget}
