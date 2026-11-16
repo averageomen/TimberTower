@@ -19,6 +19,7 @@ import {
   GameRulesMode,
   Quat,
   RoomState,
+  sanitizeStableBlocks,
   SETTLING_DURATION_MS,
   TURN_DURATION_MS,
   Vec3,
@@ -90,11 +91,9 @@ export default function App() {
   const [lobbyError, setLobbyError] = useState<string | null>(null);
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [floatingReaction, setFloatingReaction] = useState<{
-    id: string;
-    emoji: string;
-    sender: string;
-  } | null>(null);
+  const [floatingReactions, setFloatingReactions] = useState<
+    Array<{ id: string; emoji: string; sender: string; jitterX: number }>
+  >([]);
 
   const [remoteHoveredBlockId, setRemoteHoveredBlockId] = useState<number | null>(null);
   const [remoteGrabbedBlockId, setRemoteGrabbedBlockId] = useState<number | null>(null);
@@ -107,7 +106,7 @@ export default function App() {
   >(new Map());
   const localTurnTimeoutRef = useRef<number | null>(null);
   const localSettlingTimeoutRef = useRef<number | null>(null);
-  const reactionTimeoutRef = useRef<number | null>(null);
+  const reactionTimeoutsRef = useRef<number[]>([]);
   const prevTurnMarkerRef = useRef<string | null>(null);
   const lastExplosionAtRef = useRef<number | null>(null);
   const prevMovesStateRef = useRef<{ roomId: string; moves: number } | null>(null);
@@ -129,14 +128,23 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    return () => {
+      for (const id of reactionTimeoutsRef.current) {
+        window.clearTimeout(id);
+      }
+      reactionTimeoutsRef.current = [];
+    };
+  }, []);
+
   const showFloatingEmoji = useCallback((id: string, emoji: string, sender: string) => {
-    setFloatingReaction({ id, emoji, sender });
-    if (reactionTimeoutRef.current !== null) {
-      window.clearTimeout(reactionTimeoutRef.current);
-    }
-    reactionTimeoutRef.current = window.setTimeout(() => {
-      setFloatingReaction(null);
-    }, 2200);
+    const jitterX = (Math.random() - 0.5) * 14;
+    setFloatingReactions((prev) => [...prev.slice(-11), { id, emoji, sender, jitterX }]);
+    const timer = window.setTimeout(() => {
+      setFloatingReactions((prev) => prev.filter((item) => item.id !== id));
+      reactionTimeoutsRef.current = reactionTimeoutsRef.current.filter((t) => t !== timer);
+    }, 1850);
+    reactionTimeoutsRef.current.push(timer);
   }, []);
 
   // Initialize Supabase Realtime + Postgres room controller
@@ -154,7 +162,11 @@ export default function App() {
             nextState.blocksMovedCount === 0 &&
             nextState.status === 'PLAYING' &&
             (!prev || prev.status !== 'PLAYING' || prev.blocksMovedCount > 0);
-          if (isFreshMatch) {
+          const isTowerRestored = Boolean(
+            prev &&
+              (nextState.towerRestoreVersion ?? 1) !== (prev.towerRestoreVersion ?? 1)
+          );
+          if (isFreshMatch || isTowerRestored) {
             remotePhysicsFrames.current.clear();
             setMatchResetVersion((v) => v + 1);
           }
@@ -302,8 +314,9 @@ export default function App() {
       const now = Date.now();
 
       if (prev.rulesMode === 'ELIMINATION' && alivePlayers.length >= 2) {
-        const restored = cloneBlocks(
-          prev.lastStableBlocks.length > 0 ? prev.lastStableBlocks : createInitialBlocks()
+        const restored = sanitizeStableBlocks(
+          prev.lastStableBlocks.length > 0 ? prev.lastStableBlocks : createInitialBlocks(),
+          createInitialBlocks()
         );
         const nextTurn = findNextAliveLocalIndex(updatedPlayers, prev.currentTurnIndex);
         latestLocalSimTransformsRef.current.clear();
@@ -521,19 +534,23 @@ export default function App() {
         localSettlingTimeoutRef.current = window.setTimeout(() => {
           setLocalRoomState((prev) => {
             if (!prev || prev.status !== 'SETTLING') return prev;
-            const settledBlocks: BlockState[] = prev.blocks.map((b) => {
+            const candidateBlocks: BlockState[] = prev.blocks.map((b) => {
               const live = latestLocalSimTransformsRef.current.get(b.id);
               return live
                 ? { ...b, position: live.position, quaternion: live.quaternion }
                 : b;
             });
+            const settledBlocks = sanitizeStableBlocks(
+              candidateBlocks,
+              prev.lastStableBlocks
+            );
             return {
               ...prev,
               status: 'PLAYING',
               settlingStartedAt: null,
               turnStartedAt: Date.now(),
               currentTurnIndex: findNextAliveLocalIndex(prev.players, prev.currentTurnIndex),
-              blocks: settledBlocks,
+              blocks: cloneBlocks(settledBlocks),
               lastStableBlocks: cloneBlocks(settledBlocks),
             };
           });
@@ -756,7 +773,7 @@ export default function App() {
           roomState={activeRoomState}
           mySocketId={mySocketId}
           chatMessages={chatMessages}
-          floatingReaction={floatingReaction}
+          floatingReactions={floatingReactions}
           muted={muted}
           onToggleMute={handleToggleMute}
           onResetCamera={() => setCameraResetTrigger((v) => v + 1)}

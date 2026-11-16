@@ -28,7 +28,12 @@ interface GameHUDProps {
   roomState: RoomState;
   mySocketId: string | null;
   chatMessages: ChatMessage[];
-  floatingReaction: { id: string; emoji: string; sender: string } | null;
+  floatingReactions: Array<{
+    id: string;
+    emoji: string;
+    sender: string;
+    jitterX: number;
+  }>;
   muted: boolean;
   onToggleMute: () => void;
   onResetCamera: () => void;
@@ -44,7 +49,7 @@ export function GameHUD({
   roomState,
   mySocketId,
   chatMessages,
-  floatingReaction,
+  floatingReactions,
   muted,
   onToggleMute,
   onResetCamera,
@@ -59,18 +64,46 @@ export function GameHUD({
   const [eliminationBanner, setEliminationBanner] = useState<string | null>(null);
   const lastTickSecondRef = useRef<number | null>(null);
   const lastElimShownRef = useRef<number | null>(null);
+  const elimShownLocalAtRef = useRef<number>(0);
+  const elimBannerTimeoutRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    return () => {
+      if (elimBannerTimeoutRef.current !== null) {
+        window.clearTimeout(elimBannerTimeoutRef.current);
+        elimBannerTimeoutRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     const elimAt = roomState.lastEliminatedAt;
-    if (!elimAt || elimAt === lastElimShownRef.current) return;
+    if (!elimAt) {
+      lastElimShownRef.current = null;
+      setEliminationBanner(null);
+      if (elimBannerTimeoutRef.current !== null) {
+        window.clearTimeout(elimBannerTimeoutRef.current);
+        elimBannerTimeoutRef.current = null;
+      }
+      return;
+    }
+    if (elimAt === lastElimShownRef.current) return;
     lastElimShownRef.current = elimAt;
+    elimShownLocalAtRef.current = Date.now();
+
     const elimPlayer = roomState.players.find(
       (p) => p.id === roomState.lastEliminatedPlayerId
     );
     setEliminationBanner(elimPlayer?.name ?? 'A player');
-    const timer = window.setTimeout(() => setEliminationBanner(null), 3400);
-    return () => window.clearTimeout(timer);
+
+    if (elimBannerTimeoutRef.current !== null) {
+      window.clearTimeout(elimBannerTimeoutRef.current);
+    }
+    elimBannerTimeoutRef.current = window.setTimeout(() => {
+      setEliminationBanner(null);
+      elimBannerTimeoutRef.current = null;
+    }, 3000);
   }, [roomState.lastEliminatedAt, roomState.lastEliminatedPlayerId, roomState.players]);
 
   useEffect(() => {
@@ -330,47 +363,57 @@ export function GameHUD({
       )}
 
       {/* Center Overlay: Elimination Blast Alert */}
-      {eliminationBanner && roomState.status !== 'GAME_OVER' && (
-        <div className="pointer-events-none flex items-center justify-center">
-          <div className="animate-pulse rounded-2xl border border-red-500/70 bg-red-950/90 px-6 py-4 text-center shadow-2xl backdrop-blur-md">
-            <div className="text-xs font-bold uppercase tracking-[0.2em] text-red-300">
-              Player Eliminated!
-            </div>
-            <div className="mt-1 text-2xl font-extrabold text-white">
-              💥 {eliminationBanner} is OUT!
-            </div>
-            <div className="mt-1 text-xs text-red-200/80">
-              Tower restored to last playable state
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Floating Emoji Reaction Burst */}
-      {floatingReaction && (
-        <div className="pointer-events-none flex justify-center">
-          <div className="animate-bounce rounded-2xl border border-amber-400/40 bg-stone-900/90 px-4 py-2 text-center shadow-xl backdrop-blur-md">
-            <div className="text-3xl">{floatingReaction.emoji}</div>
-            <div className="text-[11px] font-medium text-amber-200">
-              {floatingReaction.sender}
+      {eliminationBanner &&
+        roomState.status !== 'GAME_OVER' &&
+        nowMs - elimShownLocalAtRef.current < 3100 && (
+          <div className="pointer-events-none flex items-center justify-center">
+            <div className="animate-pulse rounded-2xl border border-red-500/70 bg-red-950/90 px-6 py-4 text-center shadow-2xl backdrop-blur-md">
+              <div className="text-xs font-bold uppercase tracking-[0.2em] text-red-300">
+                Player Eliminated!
+              </div>
+              <div className="mt-1 text-2xl font-extrabold text-white">
+                💥 {eliminationBanner} is OUT!
+              </div>
+              <div className="mt-1 text-xs text-red-200/80">
+                Tower restored to last playable state
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
       {/* Bottom Row: Emoji Reactions & Chat Panel */}
       <div className="flex items-end justify-between gap-4">
-        {/* Quick Reaction Bar */}
-        <div className="pointer-events-auto flex items-center gap-1.5 rounded-2xl border border-stone-700/80 bg-stone-900/85 px-2.5 py-1.5 shadow-lg backdrop-blur-md">
-          {QUICK_EMOJIS.map((emoji) => (
-            <button
-              key={emoji}
-              onClick={() => onSendChat('', emoji)}
-              className="rounded-xl px-2 py-1 text-lg transition hover:scale-125 hover:bg-stone-800"
-              title={`React ${emoji}`}
-            >
-              {emoji}
-            </button>
+        {/* Quick Reaction Bar with bottom-left floating icons */}
+        <div className="relative pointer-events-auto flex items-center gap-1.5 rounded-2xl border border-stone-700/80 bg-stone-900/85 px-2.5 py-1.5 shadow-lg backdrop-blur-md">
+          {QUICK_EMOJIS.map((emoji, idx) => (
+            <div key={emoji} className="relative flex items-center justify-center">
+              <div className="pointer-events-none absolute bottom-full left-1/2 mb-1 -translate-x-1/2">
+                {floatingReactions
+                  .filter(
+                    (r) =>
+                      r.emoji === emoji ||
+                      (idx === 0 && !QUICK_EMOJIS.includes(r.emoji))
+                  )
+                  .map((reaction) => (
+                    <div
+                      key={reaction.id}
+                      style={{ marginLeft: `${reaction.jitterX}px` }}
+                      className="absolute bottom-0 left-1/2 -translate-x-1/2"
+                    >
+                      <div className="animate-emoji-float select-none text-2xl drop-shadow-[0_2px_6px_rgba(0,0,0,0.85)]">
+                        {reaction.emoji}
+                      </div>
+                    </div>
+                  ))}
+              </div>
+              <button
+                onClick={() => onSendChat('', emoji)}
+                className="rounded-xl px-2 py-1 text-lg transition hover:scale-125 hover:bg-stone-800"
+                title={`React ${emoji}`}
+              >
+                {emoji}
+              </button>
+            </div>
           ))}
         </div>
 

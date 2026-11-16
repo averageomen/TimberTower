@@ -30,3 +30,22 @@ body,
 .jenga-scroll::-webkit-scrollbar-thumb:hover {
   background: rgba(214, 180, 140, 0.45);
 }
+
+@keyframes emoji-float-up {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.75);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(-10px) scale(1.1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-120px) scale(0.95);
+  }
+}
+
+.animate-emoji-float {
+  animation: emoji-float-up 1.85s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}

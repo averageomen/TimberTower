@@ -280,7 +280,15 @@ function TowerPhysicsContent({
   const spawnProtectionUntilRef = useRef(performance.now() + 900);
   const lastSyncSentAtRef = useRef(0);
   const prevDynamicRef = useRef(false);
-  const placementDropTimeoutRef = useRef<number | null>(null);
+  const pendingPlacementRef = useRef<{
+    blockId: number;
+    layer: number;
+    slot: number;
+    dropPos: Vec3;
+    finalQuat: THREE.Quaternion;
+    releasedAt: number;
+    stillSince: number | null;
+  } | null>(null);
   const stashedOrientationRef = useRef<{
     blockId: number;
     yawSteps: number;
@@ -309,17 +317,34 @@ function TowerPhysicsContent({
 
   useEffect(() => {
     collapseReportedRef.current = false;
-    spawnProtectionUntilRef.current = performance.now() + 1000;
+    spawnProtectionUntilRef.current = performance.now() + 1100;
+    prevDynamicRef.current = isLocalSimulator;
     dragSessionRef.current = null;
     stashedOrientationRef.current = null;
+    pendingPlacementRef.current = null;
     setDragBlockId(null);
     setStashedBlockId(null);
     setOrbitEnabled(true);
     soundEngine.stopSlide();
 
-    if (placementDropTimeoutRef.current !== null) {
-      window.clearTimeout(placementDropTimeoutRef.current);
-      placementDropTimeoutRef.current = null;
+    for (const block of blocks) {
+      const body = bodyRefs.current.get(block.id);
+      if (!body) continue;
+      body.setTranslation(
+        { x: block.position[0], y: block.position[1], z: block.position[2] },
+        true
+      );
+      body.setRotation(
+        {
+          x: block.quaternion[0],
+          y: block.quaternion[1],
+          z: block.quaternion[2],
+          w: block.quaternion[3],
+        },
+        true
+      );
+      body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     }
   }, [matchResetVersion]);
 
@@ -369,6 +394,7 @@ function TowerPhysicsContent({
   const canInteractBlock = useCallback(
     (blockId: number) => {
       if (!isMyTurn || status !== 'PLAYING') return false;
+      if (pendingPlacementRef.current !== null) return false;
       if (activeBlockId !== null && activeBlockId !== blockId) return false;
       return isBlockSelectable(blocks, blockId);
     },
@@ -379,6 +405,7 @@ function TowerPhysicsContent({
     if (collapseReportedRef.current) return;
     if (status !== 'PLAYING' && status !== 'SETTLING') return;
     collapseReportedRef.current = true;
+    pendingPlacementRef.current = null;
     soundEngine.playCollapse();
     onCollapse();
   }, [status, onCollapse]);
@@ -435,23 +462,16 @@ function TowerPhysicsContent({
           Math.round((dropPos[1] - BLOCK_HEIGHT / 2) / BLOCK_HEIGHT)
         );
 
-        // Brief settle tick before emitting block:placed with current physical transform
-        placementDropTimeoutRef.current = window.setTimeout(() => {
-          const settledBody = bodyRefs.current.get(session.blockId);
-          const t = settledBody?.translation();
-          const r = settledBody?.rotation();
-          onPlaceBlock(
-            session.blockId,
-            {
-              position: t ? [t.x, t.y, t.z] : dropPos,
-              quaternion: r
-                ? [r.x, r.y, r.z, r.w]
-                : [finalQuat.x, finalQuat.y, finalQuat.z, finalQuat.w],
-            },
-            resolvedLayer,
-            slot.slot
-          );
-        }, 220);
+        // Wait until the placed block stops moving before starting the 3s SETTLING timer
+        pendingPlacementRef.current = {
+          blockId: session.blockId,
+          layer: resolvedLayer,
+          slot: slot.slot,
+          dropPos,
+          finalQuat,
+          releasedAt: performance.now(),
+          stillSince: null,
+        };
         return;
       }
     }
@@ -913,6 +933,40 @@ function TowerPhysicsContent({
       }
     }
 
+    // 1b. Start settling timer only once placed block is standing still or nearly standing still
+    const pending = pendingPlacementRef.current;
+    if (isLocalSimulator && status === 'PLAYING' && pending) {
+      const placedBody = bodyRefs.current.get(pending.blockId);
+      const nowMs = performance.now();
+      if (placedBody && nowMs - pending.releasedAt >= 140) {
+        const v = placedBody.linvel();
+        const w = placedBody.angvel();
+        const linSpeed = Math.hypot(v.x, v.y, v.z);
+        const angSpeed = Math.hypot(w.x, w.y, w.z);
+
+        if (linSpeed < 0.08 && angSpeed < 0.14) {
+          if (pending.stillSince === null) {
+            pending.stillSince = nowMs;
+          } else if (nowMs - pending.stillSince >= 160) {
+            const t = placedBody.translation();
+            const r = placedBody.rotation();
+            pendingPlacementRef.current = null;
+            onPlaceBlock(
+              pending.blockId,
+              {
+                position: [t.x, t.y, t.z],
+                quaternion: [r.x, r.y, r.z, r.w],
+              },
+              pending.layer,
+              pending.slot
+            );
+          }
+        } else {
+          pending.stillSince = null;
+        }
+      }
+    }
+
     // 2. Wake sleeping blocks slightly when tower is disturbed & check tilt/fall collapse
     if (isLocalSimulator && performance.now() > spawnProtectionUntilRef.current) {
       for (const block of blocks) {
@@ -927,7 +981,12 @@ function TowerPhysicsContent({
         if (!body) continue;
 
         const t = body.translation();
-        if (t.y < -0.25 || (block.layer > 0 && t.y < BLOCK_HEIGHT * 0.68)) {
+        const nominalY = BLOCK_HEIGHT / 2 + block.layer * BLOCK_HEIGHT;
+        if (
+          t.y < -0.25 ||
+          (block.layer > 0 && t.y < BLOCK_HEIGHT * 0.68) ||
+          t.y < nominalY - 1.1
+        ) {
           triggerCollapseOnce();
           break;
         }

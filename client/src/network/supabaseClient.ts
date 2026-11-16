@@ -12,6 +12,7 @@ import {
   Player,
   Quat,
   RoomState,
+  sanitizeStableBlocks,
   SETTLING_DURATION_MS,
   TURN_DURATION_MS,
   Vec3,
@@ -147,6 +148,7 @@ class SupabaseRoomController {
   private turnTimeoutId: number | null = null;
   private settlingTimeoutId: number | null = null;
   private disconnectTimers = new Map<string, number>();
+  private lastRestoreOrCollapseAt = 0;
 
   public getClientId(): string {
     return this.clientId;
@@ -286,13 +288,18 @@ class SupabaseRoomController {
       this.roomState,
       this.roomState.currentTurnIndex
     );
+    const stableBlocks = sanitizeStableBlocks(
+      this.roomState.blocks,
+      this.roomState.lastStableBlocks
+    );
     const nextState: RoomState = {
       ...this.roomState,
       status: 'PLAYING',
       settlingStartedAt: null,
       turnStartedAt: Date.now(),
       currentTurnIndex: nextTurnIndex,
-      lastStableBlocks: cloneBlocks(this.roomState.blocks),
+      blocks: cloneBlocks(stableBlocks),
+      lastStableBlocks: cloneBlocks(stableBlocks),
     };
     await this.commitAndBroadcastState(nextState);
   }
@@ -321,6 +328,7 @@ class SupabaseRoomController {
     reasonMessage: string
   ): Promise<void> {
     if (!this.roomState) return;
+    this.lastRestoreOrCollapseAt = Date.now();
     const updatedPlayers = this.roomState.players.map((p) =>
       p.id === loserId ? { ...p, eliminated: true } : p
     );
@@ -349,10 +357,11 @@ class SupabaseRoomController {
       return;
     }
 
-    const restoredBlocks = cloneBlocks(
+    const restoredBlocks = sanitizeStableBlocks(
       this.roomState.lastStableBlocks.length > 0
         ? this.roomState.lastStableBlocks
-        : createInitialBlocks()
+        : createInitialBlocks(),
+      createInitialBlocks()
     );
     const nextTurnIndex = this.findNextConnectedPlayerIndex(
       this.roomState,
@@ -405,6 +414,15 @@ class SupabaseRoomController {
   }
 
   private applyLocalRoomState(nextState: RoomState): void {
+    if (
+      this.roomState &&
+      ((nextState.towerRestoreVersion ?? 1) > (this.roomState.towerRestoreVersion ?? 1) ||
+        (nextState.lastEliminatedAt &&
+          nextState.lastEliminatedAt !== this.roomState.lastEliminatedAt) ||
+        (nextState.status === 'GAME_OVER' && this.roomState.status !== 'GAME_OVER'))
+    ) {
+      this.lastRestoreOrCollapseAt = Date.now();
+    }
     this.roomState = nextState;
     this.callbacks?.onRoomState(nextState);
     this.syncCoordinatorTimers(nextState);
@@ -480,6 +498,13 @@ class SupabaseRoomController {
         }
       })
       .on('broadcast', { event: 'physics:state' }, ({ payload }) => {
+        if (Date.now() - this.lastRestoreOrCollapseAt < 900) return;
+        if (
+          !this.roomState ||
+          (this.roomState.status !== 'PLAYING' && this.roomState.status !== 'SETTLING')
+        ) {
+          return;
+        }
         if (Array.isArray(payload)) {
           const compact = payload as CompactBlockTuple[];
           if (this.roomState) {
@@ -1043,6 +1068,8 @@ class SupabaseRoomController {
   public async reportCollapse(): Promise<void> {
     if (!this.roomState) return;
     if (this.roomState.status !== 'PLAYING' && this.roomState.status !== 'SETTLING') return;
+    if (Date.now() - this.lastRestoreOrCollapseAt < 2500) return;
+    this.lastRestoreOrCollapseAt = Date.now();
 
     const active = this.roomState.players[this.roomState.currentTurnIndex];
     const loserId = active?.id ?? null;

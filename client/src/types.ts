@@ -134,6 +134,120 @@ export function cloneBlocks(blocks: BlockState[]): BlockState[] {
   }));
 }
 
+function getLevelBlockQuaternion(quat: Quat): Quat {
+  const [qx, qy, qz, qw] = quat;
+  // Local Z axis projected onto horizontal XZ plane determines 90-deg yaw step
+  const zx = 2 * (qx * qz + qw * qy);
+  const zz = 1 - 2 * (qx * qx + qy * qy);
+  const yawAngle = Math.atan2(zx, zz);
+  const yawStep = ((Math.round(yawAngle / (Math.PI / 2)) % 4) + 4) % 4;
+  const halfYaw = (yawStep * (Math.PI / 2)) / 2;
+  const s = Math.sin(halfYaw);
+  const c = Math.cos(halfYaw);
+
+  // Local Y axis Y component tells whether block rests flat vs on its narrow side
+  const yy = 1 - 2 * (qx * qx + qz * qz);
+  const isOnSide = Math.abs(yy) < 0.5;
+
+  if (!isOnSide) {
+    return [0, s, 0, c];
+  }
+
+  const h = Math.SQRT1_2;
+  return [s * h, s * h, c * h, c * h];
+}
+
+export function sanitizeStableBlocks(
+  candidateBlocks: BlockState[],
+  fallbackSafeBlocks: BlockState[]
+): BlockState[] {
+  const fallbackMap = new Map<number, BlockState>();
+  for (const fb of fallbackSafeBlocks) {
+    fallbackMap.set(fb.id, fb);
+  }
+
+  const getFallbackFor = (block: BlockState): BlockState => {
+    const fb = fallbackMap.get(block.id);
+    if (fb) {
+      return {
+        ...fb,
+        position: [fb.position[0], fb.position[1], fb.position[2]],
+        quaternion: [
+          fb.quaternion[0],
+          fb.quaternion[1],
+          fb.quaternion[2],
+          fb.quaternion[3],
+        ],
+      };
+    }
+    return {
+      ...block,
+      position: getSlotPosition(block.layer, block.slot),
+      quaternion: getLayerQuaternion(block.layer),
+    };
+  };
+
+  let unsafeCount = 0;
+  const unsafeFlags = candidateBlocks.map((b) => {
+    if (b.isRemoved) return false;
+    const [x, y, z] = b.position;
+    const [qx, qy, qz, qw] = b.quaternion;
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(z) ||
+      !Number.isFinite(qx) ||
+      !Number.isFinite(qy) ||
+      !Number.isFinite(qz) ||
+      !Number.isFinite(qw)
+    ) {
+      unsafeCount++;
+      return true;
+    }
+
+    const expectedFlatY = BLOCK_HEIGHT / 2 + b.layer * BLOCK_HEIGHT;
+    const longAxisY = Math.abs(2 * (qy * qz - qw * qx));
+    const isUnsafe =
+      Math.abs(x) > 2.3 ||
+      Math.abs(z) > 2.3 ||
+      y < expectedFlatY - 0.16 ||
+      y > expectedFlatY + 0.85 ||
+      longAxisY > 0.15;
+
+    if (isUnsafe) {
+      unsafeCount++;
+    }
+    return isUnsafe;
+  });
+
+  if (unsafeCount > 1 && fallbackSafeBlocks.length > 0) {
+    return cloneBlocks(fallbackSafeBlocks);
+  }
+
+  return candidateBlocks.map((b, idx) => {
+    if (b.isRemoved) {
+      return {
+        ...b,
+        position: [b.position[0], b.position[1], b.position[2]],
+        quaternion: [
+          b.quaternion[0],
+          b.quaternion[1],
+          b.quaternion[2],
+          b.quaternion[3],
+        ],
+      };
+    }
+    if (unsafeFlags[idx]) {
+      return getFallbackFor(b);
+    }
+    return {
+      ...b,
+      position: [b.position[0], b.position[1], b.position[2]],
+      quaternion: getLevelBlockQuaternion(b.quaternion),
+    };
+  });
+}
+
 export function getHighestOccupiedLayer(
   blocks: BlockState[],
   excludeBlockId?: number | null

@@ -354,45 +354,6 @@ export function EnvironmentScene() {
         <meshStandardMaterial color="#b38a52" roughness={0.6} metalness={0.25} />
       </mesh>
 
-      {/* Overhead Pendant Lamp */}
-      <group position={[0, 18.2, 0]}>
-        {/* Suspension Cord */}
-        <mesh position={[0, 5, 0]}>
-          <cylinderGeometry args={[0.07, 0.07, 10, 12]} />
-          <meshStandardMaterial color="#1a1715" roughness={0.8} />
-        </mesh>
-        {/* Brass Canopy Neck */}
-        <mesh position={[0, 0.9, 0]}>
-          <cylinderGeometry args={[0.42, 0.55, 0.9, 24]} />
-          <meshStandardMaterial color="#b98f52" roughness={0.32} metalness={0.75} />
-        </mesh>
-        {/* Matte Charcoal Dome Shade */}
-        <mesh position={[0, 0, 0]} castShadow>
-          <coneGeometry args={[3.4, 2.1, 40, 1, true]} />
-          <meshStandardMaterial
-            color="#26211e"
-            roughness={0.45}
-            metalness={0.25}
-            side={THREE.DoubleSide}
-          />
-        </mesh>
-        {/* Inner Warm Brass Diffuser Rim */}
-        <mesh position={[0, -1.03, 0]} rotation={[Math.PI / 2, 0, 0]}>
-          <torusGeometry args={[3.4, 0.06, 12, 40]} />
-          <meshStandardMaterial color="#c89e60" roughness={0.3} metalness={0.75} />
-        </mesh>
-        {/* Glowing Warm Bulb */}
-        <mesh position={[0, -0.6, 0]}>
-          <sphereGeometry args={[0.52, 24, 24]} />
-          <meshStandardMaterial
-            color="#fff3d6"
-            emissive="#ffcf86"
-            emissiveIntensity={3.2}
-            roughness={0.2}
-          />
-        </mesh>
-      </group>
-
       {/* Cozy Room Floor, Rug & Walls */}
       <group>
         {/* Warm Hardwood Floor */}
