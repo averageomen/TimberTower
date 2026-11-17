@@ -29,11 +29,11 @@ Full-stack multiplayer 3D Jenga built with React 19, Three.js (`@react-three/fib
    git push origin main
    ```
    Then either:
-   - **In GitHub UI:** Open **Actions → Build & Release Windows EXE + macOS App → Run workflow** (set `release_tag` e.g. `v1.0.12`) and click **Run workflow**, **OR**
+   - **In GitHub UI:** Open **Actions → Build & Release Windows EXE + macOS App → Run workflow** (set `release_tag` e.g. `v1.0.13`) and click **Run workflow**, **OR**
    - **Via Git:**
      ```bash
-     git tag v1.0.12
-     git push origin v1.0.12
+     git tag v1.0.13
+     git push origin v1.0.13
      ```
 4. Share your GitHub **Releases** page with your friends!
    - **Windows:** Download **`TimberStack-Jenga-Portable.exe`** or **`TimberStack-Jenga-Setup-x.y.z.exe`**.
