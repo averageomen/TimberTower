@@ -11,6 +11,9 @@
     "electron:dev": "vite",
     "build": "tsc -b && vite build",
     "build:exe": "tsc -b && vite build && electron-builder --win --x64",
+    "build:mac": "tsc -b && vite build && electron-builder --mac --arm64 --x64",
+    "build:mac:arm64": "tsc -b && vite build && electron-builder --mac --arm64",
+    "build:mac:x64": "tsc -b && vite build && electron-builder --mac --x64",
     "dist": "tsc -b && vite build && electron-builder",
     "preview": "vite preview"
   },
@@ -72,6 +75,30 @@
       "artifactName": "TimberStack-Jenga-Setup-${version}.exe",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "category": "public.app-category.games",
+      "identity": null,
+      "artifactName": "TimberStack-Jenga-Mac-${arch}-${version}.${ext}",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "artifactName": "TimberStack-Jenga-Mac-${arch}-${version}.${ext}"
     }
   }
 }

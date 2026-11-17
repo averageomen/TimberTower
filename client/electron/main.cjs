@@ -1,7 +1,10 @@
 const { app, BrowserWindow, ipcMain, net, shell } = require('electron');
-const { spawn } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { promisify } = require('node:util');
+
+const execFileAsync = promisify(execFile);
 
 const GITHUB_RELEASE_API =
   'https://api.github.com/repos/averageomen/TimberTower/releases/latest';
@@ -23,6 +26,34 @@ function compareSemver(a, b) {
 
 function selectAssetForCurrentMode(assets) {
   if (!Array.isArray(assets)) return null;
+
+  if (process.platform === 'darwin') {
+    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+    const archRegex = new RegExp(`(mac|darwin|osx).*${arch}|${arch}.*(mac|darwin|osx)`, 'i');
+
+    // Prefer .zip for seamless in-place .app bundle self-update on macOS
+    const archZip = assets.find(
+      (a) => /\.zip$/i.test(a.name || '') && archRegex.test(a.name || '')
+    );
+    if (archZip) return archZip;
+
+    const universalZip = assets.find(
+      (a) => /\.zip$/i.test(a.name || '') && /(universal|mac|darwin|osx)/i.test(a.name || '')
+    );
+    if (universalZip) return universalZip;
+
+    const anyZip = assets.find((a) => /\.zip$/i.test(a.name || ''));
+    if (anyZip) return anyZip;
+
+    // Fallback to .dmg installer
+    const archDmg = assets.find(
+      (a) => /\.dmg$/i.test(a.name || '') && archRegex.test(a.name || '')
+    );
+    if (archDmg) return archDmg;
+
+    return assets.find((a) => /\.dmg$/i.test(a.name || '')) ?? null;
+  }
+
   const isPortable = Boolean(process.env.PORTABLE_EXECUTABLE_FILE);
 
   if (isPortable) {
@@ -42,6 +73,32 @@ function selectAssetForCurrentMode(assets) {
   );
 }
 
+function findAppBundleInDir(dirPath) {
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory() && entry.name.endsWith('.app')) {
+      return path.join(dirPath, entry.name);
+    }
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory() && !entry.name.startsWith('.')) {
+      const nested = findAppBundleInDir(path.join(dirPath, entry.name));
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+function resolveCurrentMacAppBundlePath() {
+  // process.execPath on macOS is `<AppName>.app/Contents/MacOS/<Executable>`
+  const marker = '.app/Contents/MacOS/';
+  const idx = process.execPath.indexOf(marker);
+  if (idx !== -1) {
+    return process.execPath.slice(0, idx + 4);
+  }
+  return null;
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1360,
@@ -49,7 +106,7 @@ function createMainWindow() {
     minWidth: 960,
     minHeight: 640,
     title: 'Timber Stack — 3D Multiplayer Jenga',
-    autoHideMenuBar: true,
+    autoHideMenuBar: process.platform !== 'darwin',
     backgroundColor: '#16110d',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -152,15 +209,20 @@ ipcMain.handle('updater:start', async (_event, downloadUrl) => {
 
     const totalBytes = Number(response.headers.get('content-length') || '0');
     const tempDir = app.getPath('temp');
+    const isMac = process.platform === 'darwin';
     const isPortable = Boolean(process.env.PORTABLE_EXECUTABLE_FILE);
-    const downloadedExePath = path.join(
-      tempDir,
-      isPortable
-        ? `TimberStack-Jenga-Update-${Date.now()}.exe`
-        : `TimberStack-Jenga-Setup-Update-${Date.now()}.exe`
-    );
+    const urlPath = new URL(downloadUrl).pathname.toLowerCase();
+    const isZip = urlPath.endsWith('.zip');
+    const isDmg = urlPath.endsWith('.dmg');
 
-    const fileStream = fs.createWriteStream(downloadedExePath);
+    const downloadedFileName = isMac
+      ? `TimberStack-Jenga-Update-${Date.now()}${isZip ? '.zip' : isDmg ? '.dmg' : '.pkg'}`
+      : isPortable
+        ? `TimberStack-Jenga-Update-${Date.now()}.exe`
+        : `TimberStack-Jenga-Setup-Update-${Date.now()}.exe`;
+    const downloadedFilePath = path.join(tempDir, downloadedFileName);
+
+    const fileStream = fs.createWriteStream(downloadedFilePath);
     const reader = response.body.getReader();
     let receivedBytes = 0;
     let lastReportedPct = -1;
@@ -196,6 +258,54 @@ ipcMain.handle('updater:start', async (_event, downloadUrl) => {
 
     sendProgress(100);
 
+    if (isMac) {
+      if (isZip) {
+        const extractDir = path.join(tempDir, `jenga-mac-update-${Date.now()}`);
+        fs.mkdirSync(extractDir, { recursive: true });
+        await execFileAsync('/usr/bin/ditto', ['-x', '-k', downloadedFilePath, extractDir]);
+
+        const extractedAppPath = findAppBundleInDir(extractDir);
+        if (!extractedAppPath) {
+          throw new Error('Could not find .app bundle inside downloaded macOS update archive.');
+        }
+
+        await execFileAsync('/usr/bin/xattr', ['-cr', extractedAppPath]).catch(() => undefined);
+
+        const currentAppPath = resolveCurrentMacAppBundlePath();
+        const targetAppPath =
+          currentAppPath && !currentAppPath.startsWith('/Volumes/')
+            ? currentAppPath
+            : path.join('/Applications', path.basename(extractedAppPath));
+
+        const scriptPath = path.join(tempDir, `jenga-self-update-${Date.now()}.sh`);
+        const script = [
+          '#!/bin/sh',
+          'sleep 2',
+          `rm -rf "${targetAppPath}"`,
+          `mv "${extractedAppPath}" "${targetAppPath}"`,
+          `/usr/bin/xattr -cr "${targetAppPath}" 2>/dev/null || true`,
+          `open -n "${targetAppPath}"`,
+          `rm -rf "${extractDir}" "${downloadedFilePath}" "$0"`,
+        ].join('\n');
+        fs.writeFileSync(scriptPath, script, { encoding: 'utf8', mode: 0o755 });
+
+        const child = spawn('/bin/sh', [scriptPath], {
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.unref();
+
+        app.quit();
+        return;
+      }
+
+      // Fallback for .dmg on macOS: clear quarantine & mount/open the disk image
+      await execFileAsync('/usr/bin/xattr', ['-cr', downloadedFilePath]).catch(() => undefined);
+      await shell.openPath(downloadedFilePath);
+      app.quit();
+      return;
+    }
+
     const scriptPath = path.join(tempDir, `jenga-self-update-${Date.now()}.cmd`);
     if (isPortable && process.env.PORTABLE_EXECUTABLE_FILE) {
       const targetExe = process.env.PORTABLE_EXECUTABLE_FILE;
@@ -205,7 +315,7 @@ ipcMain.handle('updater:start', async (_event, downloadUrl) => {
         'set count=0',
         ':retry',
         'ping 127.0.0.1 -n 2 > nul',
-        `move /Y "${downloadedExePath}" "${targetExe}" > nul 2>&1`,
+        `move /Y "${downloadedFilePath}" "${targetExe}" > nul 2>&1`,
         'if errorlevel 1 (',
         '  set /a count+=1',
         '  if %count% GEQ 30 exit /b 1',
@@ -220,9 +330,9 @@ ipcMain.handle('updater:start', async (_event, downloadUrl) => {
       const script = [
         '@echo off',
         'ping 127.0.0.1 -n 3 > nul',
-        `start /wait "" "${downloadedExePath}" /S`,
+        `start /wait "" "${downloadedFilePath}" /S`,
         `start "" "${installedExe}"`,
-        `del "${downloadedExePath}" > nul 2>&1`,
+        `del "${downloadedFilePath}" > nul 2>&1`,
         'del "%~f0"',
       ].join('\r\n');
       fs.writeFileSync(scriptPath, script, 'utf8');

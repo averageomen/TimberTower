@@ -75,10 +75,18 @@ export async function checkForAppUpdate(): Promise<AppUpdateInfo> {
       assets?: Array<{ name?: string; browser_download_url?: string }>;
     };
     const latestVersion = String(release.tag_name ?? currentVersion).replace(/^v/i, '');
-    const asset =
-      release.assets?.find((a) => /portable.*\.exe$/i.test(a.name ?? '')) ??
-      release.assets?.find((a) => /\.exe$/i.test(a.name ?? '')) ??
-      null;
+    const isMacBrowser =
+      typeof navigator !== 'undefined' &&
+      /Mac|iPod|iPhone|iPad/i.test(navigator.platform || navigator.userAgent || '');
+
+    const asset = isMacBrowser
+      ? release.assets?.find((a) => /\.dmg$/i.test(a.name ?? '') && /arm64/i.test(a.name ?? '')) ??
+        release.assets?.find((a) => /\.dmg$/i.test(a.name ?? '')) ??
+        release.assets?.find((a) => /mac.*\.zip$/i.test(a.name ?? '')) ??
+        null
+      : release.assets?.find((a) => /portable.*\.exe$/i.test(a.name ?? '')) ??
+        release.assets?.find((a) => /\.exe$/i.test(a.name ?? '')) ??
+        null;
 
     return {
       updateAvailable:

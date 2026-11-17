@@ -450,7 +450,7 @@ export function Lobby({
                   )}
                   {copyFallbackHint && (
                     <div className="text-[11px] text-amber-300">
-                      Clipboard access blocked — link selected above, press Ctrl+C to copy.
+                      Clipboard access blocked — link selected above, press ⌘C / Ctrl+C to copy.
                     </div>
                   )}
                 </div>

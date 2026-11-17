@@ -1,4 +1,4 @@
-name: Build & Release Windows EXE
+name: Build & Release Windows EXE + macOS App
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
       release_tag:
         description: 'Release tag to create/update on GitHub Releases (leave blank to upload workflow artifact only)'
         required: false
-        default: 'v1.0.2'
+        default: 'v1.0.10'
       supabase_url:
         description: 'Optional Supabase URL override (otherwise uses Repository Variable VITE_SUPABASE_URL)'
         required: false
@@ -52,7 +52,7 @@ jobs:
           VITE_SUPABASE_ANON_KEY: ${{ inputs.supabase_anon_key || vars.VITE_SUPABASE_ANON_KEY || secrets.VITE_SUPABASE_ANON_KEY }}
         run: npm --prefix client run build:exe
 
-      - name: Upload .exe build artifacts
+      - name: Upload Windows .exe build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: TimberStack-Jenga-Windows-EXE
@@ -60,7 +60,7 @@ jobs:
             client/release/TimberStack-Jenga-Portable.exe
             client/release/TimberStack-Jenga-Setup-*.exe
 
-      - name: Publish GitHub Release
+      - name: Publish Windows assets to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         uses: softprops/action-gh-release@v2
         with:
@@ -69,3 +69,51 @@ jobs:
           files: |
             client/release/TimberStack-Jenga-Portable.exe
             client/release/TimberStack-Jenga-Setup-*.exe
+
+  build-macos-app:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install client dependencies
+        run: npm --prefix client install
+
+      - name: Sync client version with release tag
+        shell: bash
+        run: |
+          RAW_TAG="${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}"
+          if [[ "$RAW_TAG" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+            VER="${BASH_REMATCH[1]}"
+            npm --prefix client version "$VER" --no-git-tag-version --allow-same-version
+          fi
+
+      - name: Build macOS .dmg and .zip (Apple Silicon arm64 & Intel x64)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          VITE_SUPABASE_URL: ${{ inputs.supabase_url || vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ inputs.supabase_anon_key || vars.VITE_SUPABASE_ANON_KEY || secrets.VITE_SUPABASE_ANON_KEY }}
+        run: npm --prefix client run build:mac
+
+      - name: Upload macOS build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TimberStack-Jenga-macOS
+          path: |
+            client/release/TimberStack-Jenga-Mac-*.dmg
+            client/release/TimberStack-Jenga-Mac-*.zip
+
+      - name: Publish macOS assets to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            client/release/TimberStack-Jenga-Mac-*.dmg
+            client/release/TimberStack-Jenga-Mac-*.zip
