@@ -73,3 +73,80 @@ BEGIN
   RETURN deleted_count;
 END;
 $$;
+
+-- ============================================================================
+-- Server-Side Clock & Authoritative Timer Trigger (Windows + macOS Sync)
+-- ============================================================================
+
+-- 1. RPC to fetch exact Supabase Postgres server epoch time in milliseconds
+CREATE OR REPLACE FUNCTION public.get_server_time_ms()
+RETURNS BIGINT
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+AS $$
+  SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.get_server_time_ms() TO anon, authenticated;
+
+-- 2. Trigger function that stamps authoritative server timestamps for all room timers
+CREATE OR REPLACE FUNCTION public.sync_jenga_room_timers()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  server_ms BIGINT := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT;
+  new_status TEXT := COALESCE(NEW.state->>'status', NEW.status, 'WAITING');
+  old_status TEXT := CASE WHEN TG_OP = 'UPDATE' THEN COALESCE(OLD.state->>'status', OLD.status, '') ELSE '' END;
+BEGIN
+  NEW.updated_at := clock_timestamp();
+  NEW.status := new_status;
+
+  -- Always stamp the authoritative Postgres server time and canonical durations
+  NEW.state := jsonb_set(NEW.state, '{serverTimestampMs}', to_jsonb(server_ms), true);
+  NEW.state := jsonb_set(NEW.state, '{turnDurationMs}', to_jsonb(45000), true);
+  NEW.state := jsonb_set(NEW.state, '{settlingDurationMs}', to_jsonb(3000), true);
+
+  -- Authoritative 3.0s SETTLING timer start
+  IF new_status = 'SETTLING' THEN
+    IF TG_OP = 'INSERT' OR old_status IS DISTINCT FROM 'SETTLING' THEN
+      NEW.state := jsonb_set(NEW.state, '{settlingStartedAt}', to_jsonb(server_ms), true);
+    END IF;
+  ELSE
+    NEW.state := jsonb_set(NEW.state, '{settlingStartedAt}', 'null'::jsonb, true);
+  END IF;
+
+  -- Authoritative 45s PLAYING turn timer start
+  IF new_status = 'PLAYING' THEN
+    IF TG_OP = 'INSERT'
+       OR old_status IS DISTINCT FROM 'PLAYING'
+       OR (NEW.state->>'currentTurnIndex') IS DISTINCT FROM (OLD.state->>'currentTurnIndex')
+       OR (NEW.state->>'blocksMovedCount') IS DISTINCT FROM (OLD.state->>'blocksMovedCount')
+       OR (NEW.state->>'towerRestoreVersion') IS DISTINCT FROM (OLD.state->>'towerRestoreVersion')
+    THEN
+      NEW.state := jsonb_set(NEW.state, '{turnStartedAt}', to_jsonb(server_ms), true);
+    END IF;
+  END IF;
+
+  -- Authoritative elimination timestamp for synchronized banner & audio
+  IF (NEW.state->>'lastEliminatedAt') IS NOT NULL
+     AND (NEW.state->>'lastEliminatedAt') <> 'null'
+     AND (
+       TG_OP = 'INSERT'
+       OR (NEW.state->>'lastEliminatedAt') IS DISTINCT FROM (OLD.state->>'lastEliminatedAt')
+     )
+  THEN
+    NEW.state := jsonb_set(NEW.state, '{lastEliminatedAt}', to_jsonb(server_ms), true);
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sync_jenga_room_timers ON public.jenga_rooms;
+CREATE TRIGGER trg_sync_jenga_room_timers
+  BEFORE INSERT OR UPDATE ON public.jenga_rooms
+  FOR EACH ROW
+  EXECUTE FUNCTION public.sync_jenga_room_timers();

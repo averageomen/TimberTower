@@ -63,6 +63,7 @@ export interface RoomState {
   winnerId: string | null;
   loserId: string | null;
   gameOverReason: GameOverReason;
+  serverTimestampMs?: number;
 }
 
 export interface ChatMessage {

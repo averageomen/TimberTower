@@ -15,6 +15,7 @@ import {
   VolumeX,
 } from 'lucide-react';
 import { soundEngine } from '../audio/soundEngine';
+import { supabaseMultiplayer } from '../network/supabaseClient';
 import { copyToClipboard } from './Lobby';
 import {
   ChatMessage,
@@ -61,7 +62,10 @@ export function GameHUD({
   onRematch,
   onExitToLobby,
 }: GameHUDProps) {
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  const getClockNow = () =>
+    mode === 'ONLINE' ? supabaseMultiplayer.getServerNow() : Date.now();
+
+  const [nowMs, setNowMs] = useState(() => getClockNow());
   const [chatOpen, setChatOpen] = useState(true);
   const [chatInput, setChatInput] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
@@ -94,7 +98,8 @@ export function GameHUD({
     }
     if (elimAt === lastElimShownRef.current) return;
     lastElimShownRef.current = elimAt;
-    elimShownLocalAtRef.current = Date.now();
+    elimShownLocalAtRef.current =
+      mode === 'ONLINE' ? supabaseMultiplayer.getServerNow() : Date.now();
 
     const elimPlayer = roomState.players.find(
       (p) => p.id === roomState.lastEliminatedPlayerId
@@ -108,14 +113,15 @@ export function GameHUD({
       setEliminationBanner(null);
       elimBannerTimeoutRef.current = null;
     }, 3000);
-  }, [roomState.lastEliminatedAt, roomState.lastEliminatedPlayerId, roomState.players]);
+  }, [mode, roomState.lastEliminatedAt, roomState.lastEliminatedPlayerId, roomState.players]);
 
   useEffect(() => {
+    setNowMs(mode === 'ONLINE' ? supabaseMultiplayer.getServerNow() : Date.now());
     const interval = window.setInterval(() => {
-      setNowMs(Date.now());
+      setNowMs(mode === 'ONLINE' ? supabaseMultiplayer.getServerNow() : Date.now());
     }, 100);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [mode]);
 
   useEffect(() => {
     if (chatScrollRef.current) {
@@ -128,16 +134,24 @@ export function GameHUD({
     mode === 'LOCAL' ||
     (Boolean(mySocketId) && activePlayer?.id === mySocketId);
 
-  const turnRemainingMs = Math.max(
-    0,
-    roomState.turnDurationMs - (nowMs - roomState.turnStartedAt)
+  const turnElapsedMs = Math.max(0, nowMs - roomState.turnStartedAt);
+  const turnRemainingMs = Math.min(
+    roomState.turnDurationMs,
+    Math.max(0, roomState.turnDurationMs - turnElapsedMs)
   );
   const turnRemainingSec = Math.ceil(turnRemainingMs / 1000);
   const turnPct = Math.min(100, Math.max(0, (turnRemainingMs / roomState.turnDurationMs) * 100));
 
+  const settlingElapsedMs =
+    roomState.status === 'SETTLING' && roomState.settlingStartedAt
+      ? Math.max(0, nowMs - roomState.settlingStartedAt)
+      : 0;
   const settlingRemainingMs =
     roomState.status === 'SETTLING' && roomState.settlingStartedAt
-      ? Math.max(0, roomState.settlingDurationMs - (nowMs - roomState.settlingStartedAt))
+      ? Math.min(
+          roomState.settlingDurationMs,
+          Math.max(0, roomState.settlingDurationMs - settlingElapsedMs)
+        )
       : 0;
   const settlingSec = (settlingRemainingMs / 1000).toFixed(1);
 

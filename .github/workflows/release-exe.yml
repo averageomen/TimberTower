@@ -9,7 +9,7 @@ on:
       release_tag:
         description: 'Release tag to create/update on GitHub Releases (leave blank to upload workflow artifact only)'
         required: false
-        default: 'v1.0.10'
+        default: 'v1.0.11'
       supabase_url:
         description: 'Optional Supabase URL override (otherwise uses Repository Variable VITE_SUPABASE_URL)'
         required: false

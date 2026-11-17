@@ -149,6 +149,8 @@ class SupabaseRoomController {
   private settlingTimeoutId: number | null = null;
   private disconnectTimers = new Map<string, number>();
   private lastRestoreOrCollapseAt = 0;
+  private serverTimeOffsetMs = 0;
+  private hasSyncedServerClock = false;
 
   public getClientId(): string {
     return this.clientId;
@@ -156,6 +158,55 @@ class SupabaseRoomController {
 
   public getConfig(): SupabaseConfig {
     return this.config;
+  }
+
+  public getServerNow(): number {
+    return Math.round(Date.now() + this.serverTimeOffsetMs);
+  }
+
+  private calibrateServerClock(
+    serverMs?: number | null,
+    updatedAtIso?: string | null,
+    referenceLocalMs = Date.now()
+  ): void {
+    let resolvedServerMs: number | null = null;
+    if (typeof serverMs === 'number' && Number.isFinite(serverMs) && serverMs > 0) {
+      resolvedServerMs = serverMs;
+    } else if (typeof updatedAtIso === 'string' && updatedAtIso.length > 0) {
+      const parsed = Date.parse(updatedAtIso);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        resolvedServerMs = parsed;
+      }
+    }
+
+    if (resolvedServerMs === null) return;
+    const candidateOffset = resolvedServerMs - referenceLocalMs;
+    if (!this.hasSyncedServerClock) {
+      this.serverTimeOffsetMs = candidateOffset;
+      this.hasSyncedServerClock = true;
+    } else {
+      // Smoothly blend clock offset to filter out transient network jitter
+      this.serverTimeOffsetMs = this.serverTimeOffsetMs * 0.7 + candidateOffset * 0.3;
+    }
+  }
+
+  public async syncServerClock(): Promise<void> {
+    if (!this.client) return;
+    try {
+      const t0 = Date.now();
+      const { data, error } = await this.client.rpc('get_server_time_ms');
+      const t1 = Date.now();
+      if (!error && (typeof data === 'number' || typeof data === 'string')) {
+        const serverMs = Number(data);
+        if (Number.isFinite(serverMs) && serverMs > 0) {
+          const midpointLocalMs = t0 + (t1 - t0) / 2;
+          this.serverTimeOffsetMs = serverMs - midpointLocalMs;
+          this.hasSyncedServerClock = true;
+        }
+      }
+    } catch {
+      // Ignore if RPC has not been installed yet; row updated_at/serverTimestampMs will still calibrate
+    }
   }
 
   public initialize(callbacks: SupabaseRoomCallbacks): void {
@@ -198,12 +249,24 @@ class SupabaseRoomController {
       this.callbacks?.onConnectionChange(false);
       return;
     }
-    const { error } = await this.client.from('jenga_rooms').select('room_id').limit(1);
+    const t0 = Date.now();
+    const { data, error } = await this.client
+      .from('jenga_rooms')
+      .select('room_id, updated_at')
+      .order('updated_at', { ascending: false })
+      .limit(1);
+    const t1 = Date.now();
     if (error) {
       this.callbacks?.onConnectionChange(false);
       this.callbacks?.onError(`Supabase connection check failed: ${error.message}`);
       return;
     }
+    if (Array.isArray(data) && data[0]?.updated_at && !this.hasSyncedServerClock) {
+      // Initial rough check before RPC clock sync completes
+      void t0;
+      void t1;
+    }
+    void this.syncServerClock();
     this.callbacks?.onConnectionChange(true);
   }
 
@@ -240,25 +303,42 @@ class SupabaseRoomController {
       this.settlingTimeoutId = null;
     }
 
-    if (!this.isCoordinator()) return;
+    const isCoord = this.isCoordinator();
+    const activePlayer = state.players[state.currentTurnIndex];
+    const isActiveTurnPlayer = activePlayer?.id === this.clientId;
+
+    // Coordinator runs primary timer; active player runs a +650ms backup timer in case coordinator tab is throttled
+    if (!isCoord && !isActiveTurnPlayer) return;
+    const backupDelayMs = isCoord ? 0 : 650;
+    const serverNow = this.getServerNow();
 
     if (state.status === 'PLAYING') {
-      const elapsed = Date.now() - state.turnStartedAt;
-      const remaining = Math.max(0, state.turnDurationMs - elapsed);
+      const elapsed = Math.max(0, serverNow - state.turnStartedAt);
+      const remaining = Math.min(
+        state.turnDurationMs,
+        Math.max(0, state.turnDurationMs - elapsed)
+      );
       this.turnTimeoutId = window.setTimeout(() => {
-        void this.handleTurnTimeout();
-      }, remaining);
+        void this.handleTurnTimeout(!isCoord);
+      }, remaining + backupDelayMs);
     } else if (state.status === 'SETTLING' && state.settlingStartedAt) {
-      const elapsed = Date.now() - state.settlingStartedAt;
-      const remaining = Math.max(0, state.settlingDurationMs - elapsed);
+      const elapsed = Math.max(0, serverNow - state.settlingStartedAt);
+      const remaining = Math.min(
+        state.settlingDurationMs,
+        Math.max(0, state.settlingDurationMs - elapsed)
+      );
       this.settlingTimeoutId = window.setTimeout(() => {
-        void this.completeSettlingPhase();
-      }, remaining);
+        void this.completeSettlingPhase(!isCoord);
+      }, remaining + backupDelayMs);
     }
   }
 
-  private async handleTurnTimeout(): Promise<void> {
-    if (!this.roomState || this.roomState.status !== 'PLAYING' || !this.isCoordinator()) {
+  private async handleTurnTimeout(allowBackup = false): Promise<void> {
+    if (
+      !this.roomState ||
+      this.roomState.status !== 'PLAYING' ||
+      (!this.isCoordinator() && !allowBackup)
+    ) {
       return;
     }
     const timedOutPlayer = this.roomState.players[this.roomState.currentTurnIndex];
@@ -280,8 +360,12 @@ class SupabaseRoomController {
     );
   }
 
-  private async completeSettlingPhase(): Promise<void> {
-    if (!this.roomState || this.roomState.status !== 'SETTLING' || !this.isCoordinator()) {
+  private async completeSettlingPhase(allowBackup = false): Promise<void> {
+    if (
+      !this.roomState ||
+      this.roomState.status !== 'SETTLING' ||
+      (!this.isCoordinator() && !allowBackup)
+    ) {
       return;
     }
     const nextTurnIndex = this.findNextConnectedPlayerIndex(
@@ -296,7 +380,7 @@ class SupabaseRoomController {
       ...this.roomState,
       status: 'PLAYING',
       settlingStartedAt: null,
-      turnStartedAt: Date.now(),
+      turnStartedAt: this.getServerNow(),
       currentTurnIndex: nextTurnIndex,
       blocks: cloneBlocks(stableBlocks),
       lastStableBlocks: cloneBlocks(stableBlocks),
@@ -333,7 +417,7 @@ class SupabaseRoomController {
       p.id === loserId ? { ...p, eliminated: true } : p
     );
     const alivePlayers = updatedPlayers.filter((p) => !p.eliminated && p.connected);
-    const now = Date.now();
+    const now = this.getServerNow();
 
     if (alivePlayers.length <= 1) {
       const winner = alivePlayers[0] ?? updatedPlayers.find((p) => !p.eliminated) ?? null;
@@ -413,45 +497,103 @@ class SupabaseRoomController {
     };
   }
 
-  private applyLocalRoomState(nextState: RoomState): void {
+  private applyLocalRoomState(nextState: RoomState, updatedAtIso?: string | null): void {
+    // Calibrate clock if Postgres trigger stamped serverTimestampMs or updated_at
+    if (nextState.serverTimestampMs || updatedAtIso) {
+      this.calibrateServerClock(nextState.serverTimestampMs, updatedAtIso, Date.now());
+    }
+
+    const prev = this.roomState;
+    const normalized: RoomState = { ...nextState };
+    const serverNow = this.getServerNow();
+
+    // Ensure freshly transitioned timers never have future start timestamps due to residual clock skew
+    const isFreshSettling =
+      normalized.status === 'SETTLING' &&
+      (!prev || prev.status !== 'SETTLING' || prev.blocksMovedCount !== normalized.blocksMovedCount);
+    if (normalized.status === 'SETTLING' && normalized.settlingStartedAt) {
+      if (isFreshSettling && Math.abs(serverNow - normalized.settlingStartedAt) > 600) {
+        normalized.settlingStartedAt = serverNow;
+      } else if (normalized.settlingStartedAt > serverNow) {
+        normalized.settlingStartedAt = serverNow;
+      }
+    }
+
+    const isFreshTurn =
+      normalized.status === 'PLAYING' &&
+      (!prev ||
+        prev.status !== 'PLAYING' ||
+        prev.currentTurnIndex !== normalized.currentTurnIndex ||
+        prev.blocksMovedCount !== normalized.blocksMovedCount ||
+        prev.towerRestoreVersion !== normalized.towerRestoreVersion);
+    if (normalized.status === 'PLAYING') {
+      if (isFreshTurn && Math.abs(serverNow - normalized.turnStartedAt) > 900) {
+        normalized.turnStartedAt = serverNow;
+      } else if (normalized.turnStartedAt > serverNow) {
+        normalized.turnStartedAt = serverNow;
+      }
+    }
+
     if (
-      this.roomState &&
-      ((nextState.towerRestoreVersion ?? 1) > (this.roomState.towerRestoreVersion ?? 1) ||
-        (nextState.lastEliminatedAt &&
-          nextState.lastEliminatedAt !== this.roomState.lastEliminatedAt) ||
-        (nextState.status === 'GAME_OVER' && this.roomState.status !== 'GAME_OVER'))
+      prev &&
+      ((normalized.towerRestoreVersion ?? 1) > (prev.towerRestoreVersion ?? 1) ||
+        (normalized.lastEliminatedAt &&
+          normalized.lastEliminatedAt !== prev.lastEliminatedAt) ||
+        (normalized.status === 'GAME_OVER' && prev.status !== 'GAME_OVER'))
     ) {
       this.lastRestoreOrCollapseAt = Date.now();
     }
-    this.roomState = nextState;
-    this.callbacks?.onRoomState(nextState);
-    this.syncCoordinatorTimers(nextState);
+    this.roomState = normalized;
+    this.callbacks?.onRoomState(normalized);
+    this.syncCoordinatorTimers(normalized);
   }
 
-  private async persistState(state: RoomState): Promise<void> {
-    if (!this.client) return;
-    const { error } = await this.client.from('jenga_rooms').upsert(
-      {
-        room_id: state.roomId,
-        status: state.status,
-        state,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'room_id' }
-    );
+  private async persistState(state: RoomState): Promise<RoomState> {
+    if (!this.client) return state;
+    const t0 = Date.now();
+    const { data, error } = await this.client
+      .from('jenga_rooms')
+      .upsert(
+        {
+          room_id: state.roomId,
+          status: state.status,
+          state,
+        },
+        { onConflict: 'room_id' }
+      )
+      .select('state, updated_at')
+      .single();
+    const t1 = Date.now();
+
     if (error) {
       this.callbacks?.onError(`Failed to sync room state: ${error.message}`);
+      return state;
     }
+
+    const row = data as { state?: RoomState; updated_at?: string } | null;
+    if (row) {
+      const midpoint = t0 + (t1 - t0) / 2;
+      this.calibrateServerClock(
+        row.state?.serverTimestampMs ?? null,
+        row.updated_at ?? null,
+        midpoint
+      );
+      if (row.state) {
+        return row.state;
+      }
+    }
+    return state;
   }
 
   private async commitAndBroadcastState(state: RoomState): Promise<void> {
-    this.applyLocalRoomState(state);
-    await this.persistState(state);
+    // Persist to Supabase Postgres first so the DB trigger stamps authoritative server timestamps
+    const authoritativeState = await this.persistState(state);
+    this.applyLocalRoomState(authoritativeState);
     if (this.channel) {
       await this.channel.send({
         type: 'broadcast',
         event: 'room:state',
-        payload: state,
+        payload: authoritativeState,
       });
     }
   }
@@ -464,7 +606,7 @@ class SupabaseRoomController {
       message,
       emoji,
       system: true,
-      timestamp: Date.now(),
+      timestamp: this.getServerNow(),
     };
     this.callbacks?.onChatMessage(chat);
     if (this.channel) {
@@ -562,7 +704,7 @@ class SupabaseRoomController {
           const row = payload.new as RoomRow | undefined;
           if (!row?.state) return;
           if (!this.roomState || this.shouldAdoptDbState(this.roomState, row.state)) {
-            this.applyLocalRoomState(row.state);
+            this.applyLocalRoomState(row.state, row.updated_at);
           }
         }
       )
@@ -583,7 +725,7 @@ class SupabaseRoomController {
           this.callbacks?.onConnectionChange(true);
           await channel.track({
             clientId: this.clientId,
-            joinedAt: Date.now(),
+            joinedAt: this.getServerNow(),
           });
           resolve();
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
@@ -600,6 +742,9 @@ class SupabaseRoomController {
     if (incoming.rulesMode !== local.rulesMode) return true;
     if (incoming.blocksMovedCount > local.blocksMovedCount) return true;
     if (incoming.status !== local.status) return true;
+    if (incoming.currentTurnIndex !== local.currentTurnIndex) return true;
+    if (incoming.turnStartedAt !== local.turnStartedAt) return true;
+    if (incoming.settlingStartedAt !== local.settlingStartedAt) return true;
     if (incoming.players.length !== local.players.length) return true;
     if (incoming.activeBlockId !== local.activeBlockId) return true;
     return false;
@@ -705,7 +850,7 @@ class SupabaseRoomController {
         activeBlockId: null,
         status: 'PLAYING',
         settlingStartedAt: null,
-        turnStartedAt: Date.now(),
+        turnStartedAt: this.getServerNow(),
         currentTurnIndex: this.findNextConnectedPlayerIndex(
           this.roomState,
           this.roomState.currentTurnIndex
@@ -726,6 +871,7 @@ class SupabaseRoomController {
     }
 
     await this.leaveRoom();
+    await this.syncServerClock();
 
     let roomId = generateRoomCode();
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -755,7 +901,7 @@ class SupabaseRoomController {
       players: [hostPlayer],
       currentTurnIndex: 0,
       startingPlayerIndex: 0,
-      turnStartedAt: Date.now(),
+      turnStartedAt: this.getServerNow(),
       turnDurationMs: TURN_DURATION_MS,
       settlingStartedAt: null,
       settlingDurationMs: SETTLING_DURATION_MS,
@@ -772,9 +918,9 @@ class SupabaseRoomController {
     };
 
     try {
-      await this.persistState(initialState);
+      const authoritativeState = await this.persistState(initialState);
       await this.subscribeToRoomChannel(roomId);
-      this.applyLocalRoomState(initialState);
+      this.applyLocalRoomState(authoritativeState);
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Failed to create Supabase room.';
       this.callbacks?.onError(msg);
@@ -793,9 +939,11 @@ class SupabaseRoomController {
       return;
     }
 
+    await this.syncServerClock();
+
     const { data, error } = await this.client
       .from('jenga_rooms')
-      .select('state')
+      .select('state, updated_at')
       .eq('room_id', roomId)
       .maybeSingle();
 
@@ -914,7 +1062,7 @@ class SupabaseRoomController {
       status: 'PLAYING',
       startingPlayerIndex: 0,
       currentTurnIndex: 0,
-      turnStartedAt: Date.now(),
+      turnStartedAt: this.getServerNow(),
       settlingStartedAt: null,
       activeBlockId: null,
       blocksMovedCount: 0,
@@ -1055,7 +1203,7 @@ class SupabaseRoomController {
     const nextState: RoomState = {
       ...this.roomState,
       status: 'SETTLING',
-      settlingStartedAt: Date.now(),
+      settlingStartedAt: this.getServerNow(),
       activeBlockId: null,
       blocksMovedCount: this.roomState.blocksMovedCount + 1,
       players: nextPlayers,
@@ -1110,7 +1258,7 @@ class SupabaseRoomController {
       status: 'PLAYING',
       startingPlayerIndex: nextStarter,
       currentTurnIndex: nextStarter,
-      turnStartedAt: Date.now(),
+      turnStartedAt: this.getServerNow(),
       settlingStartedAt: null,
       activeBlockId: null,
       blocksMovedCount: 0,
@@ -1149,7 +1297,7 @@ class SupabaseRoomController {
       message: cleanMessage,
       emoji: cleanEmoji,
       system: false,
-      timestamp: Date.now(),
+      timestamp: this.getServerNow(),
     };
 
     this.callbacks?.onChatMessage(chat);
