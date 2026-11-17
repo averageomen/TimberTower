@@ -10,8 +10,10 @@ import {
 } from './network/supabaseClient';
 import { JengaTower } from './scene/JengaTower';
 import {
+  advanceBurningBlocksOnTurn,
   BlockState,
   BURN_DURATION_MS,
+  BURN_MAX_TURNS,
   ChatMessage,
   clearAllPowerUpsOnBlocks,
   cloneBlocks,
@@ -335,12 +337,18 @@ export default function App() {
 
       if (prev.rulesMode === 'ELIMINATION' && alivePlayers.length >= 2) {
         const powerUpsOn = prev.powerUpsEnabled !== false;
-        const restored = sanitizeStableBlocks(
+        const sanitizedRestore = sanitizeStableBlocks(
           prev.lastStableBlocks.length > 0
             ? prev.lastStableBlocks
             : createInitialBlocks(powerUpsOn),
           createInitialBlocks(powerUpsOn)
         );
+        const burnStep = powerUpsOn
+          ? advanceBurningBlocksOnTurn(sanitizedRestore)
+          : { blocks: sanitizedRestore, spreadCount: 0, extinguishedCount: 0 };
+        const restored = powerUpsOn
+          ? maybeSpawnMysteryBlock(burnStep.blocks)
+          : burnStep.blocks;
         const nextTurn = findNextAliveLocalIndex(updatedPlayers, prev.currentTurnIndex);
         latestLocalSimTransformsRef.current.clear();
         return {
@@ -464,12 +472,23 @@ export default function App() {
           ...prev,
           blocks: prev.blocks.map((b) =>
             b.id === burning.blockId
-              ? { ...b, isRemoved: true, effect: null, hasMysteryPowerUp: false }
+              ? {
+                  ...b,
+                  isRemoved: true,
+                  effect: null,
+                  burnTurnsRemaining: null,
+                  hasMysteryPowerUp: false,
+                }
               : b
           ),
           lastStableBlocks: prev.lastStableBlocks.map((b) =>
             b.id === burning.blockId
-              ? { ...b, effect: null, hasMysteryPowerUp: false }
+              ? {
+                  ...b,
+                  effect: null,
+                  burnTurnsRemaining: null,
+                  hasMysteryPowerUp: false,
+                }
               : b
           ),
           burningBlock: null,
@@ -720,10 +739,24 @@ export default function App() {
               idx === activeIdx ? { ...p, powerUp: null } : p
             ),
             blocks: prev.blocks.map((b) =>
-              b.id === blockId ? { ...b, effect: nextEffect, hasMysteryPowerUp: false } : b
+              b.id === blockId
+                ? {
+                    ...b,
+                    effect: nextEffect,
+                    burnTurnsRemaining: nextEffect === 'BURN' ? BURN_MAX_TURNS : null,
+                    hasMysteryPowerUp: false,
+                  }
+                : b
             ),
             lastStableBlocks: prev.lastStableBlocks.map((b) =>
-              b.id === blockId ? { ...b, effect: nextEffect, hasMysteryPowerUp: false } : b
+              b.id === blockId
+                ? {
+                    ...b,
+                    effect: nextEffect,
+                    burnTurnsRemaining: nextEffect === 'BURN' ? BURN_MAX_TURNS : null,
+                    hasMysteryPowerUp: false,
+                  }
+                : b
             ),
             burningBlock: startNow
               ? {
@@ -784,6 +817,7 @@ export default function App() {
                   position: finalTransform.position,
                   quaternion: finalTransform.quaternion,
                   effect: null,
+                  burnTurnsRemaining: null,
                 }
               : b
           );
@@ -819,9 +853,12 @@ export default function App() {
               prev.lastStableBlocks
             );
             const powerUpsOn = prev.powerUpsEnabled !== false;
+            const burnStep = powerUpsOn
+              ? advanceBurningBlocksOnTurn(sanitized)
+              : { blocks: sanitized, spreadCount: 0, extinguishedCount: 0 };
             const settledBlocks = powerUpsOn
-              ? maybeSpawnMysteryBlock(sanitized)
-              : sanitized;
+              ? maybeSpawnMysteryBlock(burnStep.blocks)
+              : burnStep.blocks;
             return {
               ...prev,
               status: 'PLAYING',

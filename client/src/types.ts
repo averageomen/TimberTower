@@ -53,6 +53,7 @@ export interface BlockState {
   isRemoved: boolean;
   hasMysteryPowerUp?: boolean;
   effect?: BlockEffectType | null;
+  burnTurnsRemaining?: number | null;
 }
 
 export interface RoomState {
@@ -109,6 +110,7 @@ export const TOTAL_BLOCKS = INITIAL_LAYERS * BLOCKS_PER_LAYER;
 export const TURN_DURATION_MS = 45_000;
 export const SETTLING_DURATION_MS = 3_000;
 export const BURN_DURATION_MS = 10_000;
+export const BURN_MAX_TURNS = 3;
 
 const EVEN_QUAT: Quat = [0, 0, 0, 1];
 const ODD_QUAT: Quat = [0, Math.SQRT1_2, 0, Math.SQRT1_2];
@@ -154,7 +156,7 @@ export function maybeSpawnMysteryBlock(blocks: BlockState[]): BlockState[] {
   const activeMysteryCount = blocks.filter(
     (b) => !b.isRemoved && b.hasMysteryPowerUp && isBlockSelectable(blocks, b.id)
   ).length;
-  if (activeMysteryCount >= 5 || Math.random() >= 0.55) {
+  if (activeMysteryCount >= 4 || Math.random() >= 0.45) {
     return blocks;
   }
   const candidates = blocks.filter(
@@ -171,15 +173,96 @@ export function maybeSpawnMysteryBlock(blocks: BlockState[]): BlockState[] {
   );
 }
 
+/** Spreads fire from each active burning block to 1 neighbor and extinguishes blocks after 3 turns. */
+export function advanceBurningBlocksOnTurn(blocks: BlockState[]): {
+  blocks: BlockState[];
+  spreadCount: number;
+  extinguishedCount: number;
+} {
+  const activeBurning = blocks.filter((b) => !b.isRemoved && b.effect === 'BURN');
+  if (activeBurning.length === 0) {
+    return { blocks, spreadCount: 0, extinguishedCount: 0 };
+  }
+
+  const newlyIgnitedIds = new Set<number>();
+
+  for (const source of activeBurning) {
+    const isAvailable = (cand: BlockState) =>
+      !cand.isRemoved &&
+      cand.id !== source.id &&
+      cand.effect !== 'BURN' &&
+      !newlyIgnitedIds.has(cand.id);
+
+    let neighbors = blocks.filter((cand) => {
+      if (!isAvailable(cand)) return false;
+      const layerDiff = Math.abs(cand.layer - source.layer);
+      const dx = cand.position[0] - source.position[0];
+      const dy = cand.position[1] - source.position[1];
+      const dz = cand.position[2] - source.position[2];
+      const dist = Math.hypot(dx, dy, dz);
+      return layerDiff <= 1 || dist <= 3.8;
+    });
+
+    if (neighbors.length === 0) {
+      neighbors = blocks.filter(
+        (cand) => isAvailable(cand) && Math.abs(cand.layer - source.layer) <= 2
+      );
+    }
+
+    if (neighbors.length > 0) {
+      const picked = neighbors[Math.floor(Math.random() * neighbors.length)];
+      if (picked) {
+        newlyIgnitedIds.add(picked.id);
+      }
+    }
+  }
+
+  let extinguishedCount = 0;
+  const nextBlocks = blocks.map((b) => {
+    if (b.isRemoved) {
+      return {
+        ...b,
+        effect: null,
+        burnTurnsRemaining: null,
+        hasMysteryPowerUp: false,
+      };
+    }
+    if (b.effect === 'BURN') {
+      const nextRemaining = (b.burnTurnsRemaining ?? BURN_MAX_TURNS) - 1;
+      if (nextRemaining <= 0) {
+        extinguishedCount++;
+        return { ...b, effect: null, burnTurnsRemaining: null };
+      }
+      return { ...b, effect: 'BURN' as const, burnTurnsRemaining: nextRemaining };
+    }
+    if (newlyIgnitedIds.has(b.id)) {
+      return {
+        ...b,
+        effect: 'BURN' as const,
+        burnTurnsRemaining: BURN_MAX_TURNS,
+        hasMysteryPowerUp: false,
+      };
+    }
+    return b;
+  });
+
+  return {
+    blocks: nextBlocks,
+    spreadCount: newlyIgnitedIds.size,
+    extinguishedCount,
+  };
+}
+
 export function clearAllPowerUpsOnBlocks(blocks: BlockState[]): BlockState[] {
   return blocks.map((b) => ({
     ...b,
     hasMysteryPowerUp: false,
     effect: null,
+    burnTurnsRemaining: null,
   }));
 }
 
-export function createInitialBlocks(spawnPowerUps = true): BlockState[] {
+export function createInitialBlocks(_spawnPowerUps = true): BlockState[] {
   const blocks: BlockState[] = [];
   for (let layer = 0; layer < INITIAL_LAYERS; layer++) {
     for (let slot = 0; slot < BLOCKS_PER_LAYER; slot++) {
@@ -193,10 +276,11 @@ export function createInitialBlocks(spawnPowerUps = true): BlockState[] {
         isRemoved: false,
         hasMysteryPowerUp: false,
         effect: null,
+        burnTurnsRemaining: null,
       });
     }
   }
-  return spawnPowerUps ? seedMysteryPowerUpBlocks(blocks, 7) : blocks;
+  return blocks;
 }
 
 export function cloneBlocks(blocks: BlockState[]): BlockState[] {
@@ -206,6 +290,8 @@ export function cloneBlocks(blocks: BlockState[]): BlockState[] {
     quaternion: [b.quaternion[0], b.quaternion[1], b.quaternion[2], b.quaternion[3]],
     hasMysteryPowerUp: Boolean(b.hasMysteryPowerUp),
     effect: b.effect ?? null,
+    burnTurnsRemaining:
+      typeof b.burnTurnsRemaining === 'number' ? b.burnTurnsRemaining : null,
   }));
 }
 

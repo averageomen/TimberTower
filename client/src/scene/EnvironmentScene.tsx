@@ -211,6 +211,145 @@ function PottedSucculent({ position }: { position: [number, number, number] }) {
   );
 }
 
+function PottedSunflower({ position }: { position: [number, number, number] }) {
+  const stemSwayRef = useRef<THREE.Group>(null);
+
+  const outerPetals = useMemo(
+    () => Array.from({ length: 18 }, (_, i) => (i / 18) * Math.PI * 2),
+    []
+  );
+  const innerPetals = useMemo(
+    () => Array.from({ length: 18 }, (_, i) => ((i + 0.5) / 18) * Math.PI * 2),
+    []
+  );
+
+  useFrame(({ clock }) => {
+    if (!stemSwayRef.current) return;
+    const t = clock.getElapsedTime();
+    stemSwayRef.current.rotation.z = Math.sin(t * 0.9) * 0.028;
+    stemSwayRef.current.rotation.x = Math.cos(t * 0.7) * 0.02;
+  });
+
+  return (
+    <group position={position}>
+      {/* Stone Coaster */}
+      <mesh position={[0, 0.05, 0]} castShadow receiveShadow>
+        <cylinderGeometry args={[1.45, 1.5, 0.1, 32]} />
+        <meshStandardMaterial color="#4b4743" roughness={0.85} />
+      </mesh>
+      {/* Glazed Terracotta Pot */}
+      <mesh position={[0, 0.85, 0]} castShadow receiveShadow>
+        <cylinderGeometry args={[1.12, 0.84, 1.5, 28]} />
+        <meshStandardMaterial color="#c97249" roughness={0.68} />
+      </mesh>
+      {/* Pot Rim */}
+      <mesh position={[0, 1.54, 0]} castShadow receiveShadow>
+        <cylinderGeometry args={[1.2, 1.18, 0.22, 28]} />
+        <meshStandardMaterial color="#d47d54" roughness={0.65} />
+      </mesh>
+      {/* Soil */}
+      <mesh position={[0, 1.52, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[1.06, 24]} />
+        <meshStandardMaterial color="#38281e" roughness={0.96} />
+      </mesh>
+
+      {/* Swaying Stem, Leaves & Sunflower Blossom */}
+      <group ref={stemSwayRef} position={[0, 1.5, 0]}>
+        {/* Lower & Upper Green Stem */}
+        <mesh position={[0, 1.45, 0]} castShadow>
+          <cylinderGeometry args={[0.085, 0.125, 2.95, 14]} />
+          <meshStandardMaterial color="#3e6b34" roughness={0.72} />
+        </mesh>
+
+        {/* Broad Sunflower Leaves on Stem */}
+        <group position={[0, 0.95, 0]} rotation={[0, 0.55, 0]}>
+          <mesh
+            position={[0.42, 0.12, 0]}
+            rotation={[0.15, 0, -0.62]}
+            scale={[0.52, 0.08, 0.34]}
+            castShadow
+          >
+            <sphereGeometry args={[1, 14, 12]} />
+            <meshStandardMaterial color="#4f8342" roughness={0.65} />
+          </mesh>
+        </group>
+        <group position={[0, 1.55, 0]} rotation={[0, -1.9, 0]}>
+          <mesh
+            position={[0.45, 0.1, 0]}
+            rotation={[-0.1, 0, -0.58]}
+            scale={[0.54, 0.08, 0.36]}
+            castShadow
+          >
+            <sphereGeometry args={[1, 14, 12]} />
+            <meshStandardMaterial color="#588f49" roughness={0.65} />
+          </mesh>
+        </group>
+        <group position={[0, 2.1, 0]} rotation={[0, 2.45, 0]}>
+          <mesh
+            position={[0.38, 0.1, 0]}
+            rotation={[0.08, 0, -0.52]}
+            scale={[0.45, 0.075, 0.3]}
+            castShadow
+          >
+            <sphereGeometry args={[1, 14, 12]} />
+            <meshStandardMaterial color="#4d7e3f" roughness={0.65} />
+          </mesh>
+        </group>
+
+        {/* Sunflower Head angled slightly toward the center table */}
+        <group position={[0, 2.95, 0]} rotation={[0.42, 0.65, 0]}>
+          {/* Green Receptacle / Calyx behind petals (apex pointing back to stem) */}
+          <mesh position={[0, 0, -0.14]} rotation={[-Math.PI / 2, 0, 0]} castShadow>
+            <coneGeometry args={[0.62, 0.34, 18]} />
+            <meshStandardMaterial color="#426e37" roughness={0.72} />
+          </mesh>
+
+          {/* Outer Ring of Golden-Yellow Petals */}
+          {outerPetals.map((angle, idx) => (
+            <group key={`sp-outer-${idx}`} rotation={[0, 0, angle]}>
+              <mesh
+                position={[0, 0.88, -0.04]}
+                rotation={[-0.12, 0, 0]}
+                scale={[0.2, 0.56, 0.045]}
+                castShadow
+              >
+                <sphereGeometry args={[1, 10, 10]} />
+                <meshStandardMaterial color="#f5b400" roughness={0.52} />
+              </mesh>
+            </group>
+          ))}
+
+          {/* Inner Staggered Ring of Bright Yellow Petals */}
+          {innerPetals.map((angle, idx) => (
+            <group key={`sp-inner-${idx}`} rotation={[0, 0, angle]}>
+              <mesh
+                position={[0, 0.78, 0.02]}
+                rotation={[0.06, 0, 0]}
+                scale={[0.17, 0.48, 0.04]}
+                castShadow
+              >
+                <sphereGeometry args={[1, 10, 10]} />
+                <meshStandardMaterial color="#ffd230" roughness={0.48} />
+              </mesh>
+            </group>
+          ))}
+
+          {/* Dark Seed Center */}
+          <mesh position={[0, 0, 0.04]} scale={[1, 1, 0.38]} castShadow>
+            <sphereGeometry args={[0.56, 24, 18]} />
+            <meshStandardMaterial color="#3b2313" roughness={0.94} />
+          </mesh>
+          {/* Golden-Brown Pollen Ring */}
+          <mesh position={[0, 0, 0.14]}>
+            <torusGeometry args={[0.4, 0.085, 10, 28]} />
+            <meshStandardMaterial color="#7d4a18" roughness={0.88} />
+          </mesh>
+        </group>
+      </group>
+    </group>
+  );
+}
+
 function BrassCoasterSet({ position }: { position: [number, number, number] }) {
   return (
     <group position={position}>
@@ -342,6 +481,7 @@ export function EnvironmentScene() {
       {/* Table Props */}
       <CoffeeMugProp position={[-9.8, 0, 5.4]} />
       <PottedSucculent position={[9.6, 0, -6.2]} />
+      <PottedSunflower position={[-9.2, 0, -6.2]} />
       <BrassCoasterSet position={[9.4, 0, 6.1]} />
 
       {/* Center Subtle Woven Table Mat */}

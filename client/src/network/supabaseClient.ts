@@ -2,7 +2,9 @@ import { createClient, RealtimeChannel, SupabaseClient } from '@supabase/supabas
 import { customAlphabet, nanoid } from 'nanoid';
 import { GlobalSoundEvent } from '../audio/soundEngine';
 import {
+  advanceBurningBlocksOnTurn,
   BURN_DURATION_MS,
+  BURN_MAX_TURNS,
   ChatMessage,
   clearAllPowerUpsOnBlocks,
   cloneBlocks,
@@ -362,12 +364,18 @@ class SupabaseRoomController {
 
     const updatedBlocks = this.roomState.blocks.map((b) =>
       b.id === burnBlockId
-        ? { ...b, isRemoved: true, effect: null, hasMysteryPowerUp: false }
+        ? {
+            ...b,
+            isRemoved: true,
+            effect: null,
+            burnTurnsRemaining: null,
+            hasMysteryPowerUp: false,
+          }
         : b
     );
     const updatedStableBlocks = this.roomState.lastStableBlocks.map((b) =>
       b.id === burnBlockId
-        ? { ...b, effect: null, hasMysteryPowerUp: false }
+        ? { ...b, effect: null, burnTurnsRemaining: null, hasMysteryPowerUp: false }
         : b
     );
 
@@ -438,7 +446,12 @@ class SupabaseRoomController {
       this.roomState.lastStableBlocks
     );
     const powerUpsOn = this.roomState.powerUpsEnabled !== false;
-    const stableBlocks = powerUpsOn ? maybeSpawnMysteryBlock(sanitized) : sanitized;
+    const burnStep = powerUpsOn
+      ? advanceBurningBlocksOnTurn(sanitized)
+      : { blocks: sanitized, spreadCount: 0, extinguishedCount: 0 };
+    const stableBlocks = powerUpsOn
+      ? maybeSpawnMysteryBlock(burnStep.blocks)
+      : burnStep.blocks;
     const nextState: RoomState = {
       ...this.roomState,
       status: 'PLAYING',
@@ -452,6 +465,17 @@ class SupabaseRoomController {
       lastStableBlocks: cloneBlocks(stableBlocks),
     };
     await this.commitAndBroadcastState(nextState);
+    if (burnStep.spreadCount > 0) {
+      await this.broadcastSystemChat(
+        `🔥 Fire spread to ${burnStep.spreadCount} nearby block${burnStep.spreadCount > 1 ? 's' : ''}!`,
+        '🔥'
+      );
+    } else if (burnStep.extinguishedCount > 0) {
+      await this.broadcastSystemChat(
+        `💨 ${burnStep.extinguishedCount} burning block${burnStep.extinguishedCount > 1 ? 's' : ''} burned out!`,
+        '💨'
+      );
+    }
   }
 
   private findNextConnectedPlayerIndex(
@@ -511,12 +535,18 @@ class SupabaseRoomController {
     }
 
     const powerUpsOn = this.roomState.powerUpsEnabled !== false;
-    const restoredBlocks = sanitizeStableBlocks(
+    const sanitizedRestore = sanitizeStableBlocks(
       this.roomState.lastStableBlocks.length > 0
         ? this.roomState.lastStableBlocks
         : createInitialBlocks(powerUpsOn),
       createInitialBlocks(powerUpsOn)
     );
+    const burnStep = powerUpsOn
+      ? advanceBurningBlocksOnTurn(sanitizedRestore)
+      : { blocks: sanitizedRestore, spreadCount: 0, extinguishedCount: 0 };
+    const restoredBlocks = powerUpsOn
+      ? maybeSpawnMysteryBlock(burnStep.blocks)
+      : burnStep.blocks;
     const nextTurnIndex = this.findNextConnectedPlayerIndex(
       this.roomState,
       this.roomState.currentTurnIndex,
@@ -845,6 +875,7 @@ class SupabaseRoomController {
       incoming.blocks.some(
         (b, i) =>
           b.effect !== local.blocks[i]?.effect ||
+          b.burnTurnsRemaining !== local.blocks[i]?.burnTurnsRemaining ||
           b.hasMysteryPowerUp !== local.blocks[i]?.hasMysteryPowerUp ||
           b.isRemoved !== local.blocks[i]?.isRemoved
       )
@@ -1348,14 +1379,25 @@ class SupabaseRoomController {
     const nextPlayers = this.roomState.players.map((p, idx) =>
       idx === this.roomState!.currentTurnIndex ? { ...p, powerUp: null } : p
     );
+    const nextBurnTurns = nextEffect === 'BURN' ? BURN_MAX_TURNS : null;
     const nextBlocks = this.roomState.blocks.map((b) =>
       b.id === blockId
-        ? { ...b, effect: nextEffect as 'ICE' | 'BURN', hasMysteryPowerUp: false }
+        ? {
+            ...b,
+            effect: nextEffect as 'ICE' | 'BURN',
+            burnTurnsRemaining: nextBurnTurns,
+            hasMysteryPowerUp: false,
+          }
         : b
     );
     const nextStableBlocks = this.roomState.lastStableBlocks.map((b) =>
       b.id === blockId
-        ? { ...b, effect: nextEffect as 'ICE' | 'BURN', hasMysteryPowerUp: false }
+        ? {
+            ...b,
+            effect: nextEffect as 'ICE' | 'BURN',
+            burnTurnsRemaining: nextBurnTurns,
+            hasMysteryPowerUp: false,
+          }
         : b
     );
 
@@ -1448,6 +1490,7 @@ class SupabaseRoomController {
             quaternion: finalTransform.quaternion,
             isRemoved: false,
             effect: null,
+            burnTurnsRemaining: null,
           }
         : b
     );
