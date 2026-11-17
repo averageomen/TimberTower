@@ -95,7 +95,6 @@ jobs:
 
       - name: Build macOS .dmg and .zip (Apple Silicon arm64 & Intel x64)
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
           VITE_SUPABASE_URL: ${{ inputs.supabase_url || vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ inputs.supabase_anon_key || vars.VITE_SUPABASE_ANON_KEY || secrets.VITE_SUPABASE_ANON_KEY }}
         run: npm --prefix client run build:mac

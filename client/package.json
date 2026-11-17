@@ -78,7 +78,7 @@
     },
     "mac": {
       "category": "public.app-category.games",
-      "identity": null,
+      "identity": "-",
       "artifactName": "TimberStack-Jenga-Mac-${arch}-${version}.${ext}",
       "target": [
         {
