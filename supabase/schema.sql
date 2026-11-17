@@ -104,10 +104,13 @@ BEGIN
   NEW.updated_at := clock_timestamp();
   NEW.status := new_status;
 
-  -- Always stamp the authoritative Postgres server time and canonical durations
+  -- Always stamp the authoritative Postgres server time, canonical durations, and power-up toggle default
   NEW.state := jsonb_set(NEW.state, '{serverTimestampMs}', to_jsonb(server_ms), true);
   NEW.state := jsonb_set(NEW.state, '{turnDurationMs}', to_jsonb(45000), true);
   NEW.state := jsonb_set(NEW.state, '{settlingDurationMs}', to_jsonb(3000), true);
+  IF (NEW.state->'powerUpsEnabled') IS NULL OR jsonb_typeof(NEW.state->'powerUpsEnabled') <> 'boolean' THEN
+    NEW.state := jsonb_set(NEW.state, '{powerUpsEnabled}', 'true'::jsonb, true);
+  END IF;
 
   -- Authoritative 3.0s SETTLING timer start
   IF new_status = 'SETTLING' THEN
@@ -130,15 +133,32 @@ BEGIN
     END IF;
   END IF;
 
-  -- Authoritative elimination timestamp for synchronized banner & audio
-  IF (NEW.state->>'lastEliminatedAt') IS NOT NULL
-     AND (NEW.state->>'lastEliminatedAt') <> 'null'
+  -- Authoritative elimination timestamp for synchronized banner & audio (never re-stamp on grabs/placements)
+  IF (NEW.state->>'lastEliminatedPlayerId') IS NOT NULL
+     AND (NEW.state->>'lastEliminatedPlayerId') <> 'null'
      AND (
        TG_OP = 'INSERT'
-       OR (NEW.state->>'lastEliminatedAt') IS DISTINCT FROM (OLD.state->>'lastEliminatedAt')
+       OR (CASE WHEN TG_OP = 'UPDATE' THEN NEW.state->>'towerRestoreVersion' ELSE NULL END)
+          IS DISTINCT FROM (CASE WHEN TG_OP = 'UPDATE' THEN OLD.state->>'towerRestoreVersion' ELSE NULL END)
+       OR (
+         old_status IS DISTINCT FROM 'GAME_OVER'
+         AND new_status = 'GAME_OVER'
+       )
      )
   THEN
     NEW.state := jsonb_set(NEW.state, '{lastEliminatedAt}', to_jsonb(server_ms), true);
+  END IF;
+
+  -- Authoritative 10s Burning Hand countdown timer start (disabled when powerUpsEnabled = false)
+  IF COALESCE((NEW.state->>'powerUpsEnabled')::boolean, true) = false THEN
+    NEW.state := jsonb_set(NEW.state, '{burningBlock}', 'null'::jsonb, true);
+  ELSIF jsonb_typeof(NEW.state->'burningBlock') = 'object' THEN
+    IF TG_OP = 'INSERT'
+       OR (CASE WHEN TG_OP = 'UPDATE' THEN jsonb_typeof(OLD.state->'burningBlock') ELSE NULL END) IS DISTINCT FROM 'object'
+       OR (NEW.state->'burningBlock'->>'blockId') IS DISTINCT FROM (CASE WHEN TG_OP = 'UPDATE' THEN OLD.state->'burningBlock'->>'blockId' ELSE NULL END)
+    THEN
+      NEW.state := jsonb_set(NEW.state, '{burningBlock,startedAt}', to_jsonb(server_ms), true);
+    END IF;
   END IF;
 
   RETURN NEW;

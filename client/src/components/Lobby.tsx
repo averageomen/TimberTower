@@ -78,10 +78,15 @@ interface LobbyProps {
   onToggleMute: () => void;
   onSaveSupabaseConfig: (url: string, anonKey: string) => void;
   onSetOnlineRulesMode: (rulesMode: GameRulesMode) => void;
+  onSetOnlinePowerUpsEnabled: (enabled: boolean) => void;
   onCreateOnlineRoom: (playerName: string) => void;
   onJoinOnlineRoom: (roomId: string, playerName: string) => void;
   onStartOnlineGame: () => void;
-  onStartLocalGame: (playerNames: string[], rulesMode: GameRulesMode) => void;
+  onStartLocalGame: (
+    playerNames: string[],
+    rulesMode: GameRulesMode,
+    powerUpsEnabled: boolean
+  ) => void;
   onLeaveOnlineRoom: () => void;
   onClearError: () => void;
 }
@@ -97,6 +102,7 @@ export function Lobby({
   onToggleMute,
   onSaveSupabaseConfig,
   onSetOnlineRulesMode,
+  onSetOnlinePowerUpsEnabled,
   onCreateOnlineRoom,
   onJoinOnlineRoom,
   onStartOnlineGame,
@@ -111,6 +117,7 @@ export function Lobby({
   const [keyDraft, setKeyDraft] = useState(supabaseConfig.anonKey);
   const [showServerConfig, setShowServerConfig] = useState(false);
   const [localRulesMode, setLocalRulesMode] = useState<GameRulesMode>('CLASSIC');
+  const [localPowerUpsEnabled, setLocalPowerUpsEnabled] = useState(true);
   const [localPlayers, setLocalPlayers] = useState<string[]>(['Player 1', 'Player 2']);
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [copyFallbackHint, setCopyFallbackHint] = useState(false);
@@ -493,6 +500,54 @@ export function Lobby({
                 </div>
               </div>
 
+              {(() => {
+                const onlinePowerUpsOn = roomState.powerUpsEnabled !== false;
+                return (
+                  <div className="flex items-center justify-between rounded-xl border border-stone-800 bg-stone-950/60 px-3.5 py-2.5">
+                    <div className="flex items-center gap-2.5">
+                      <Sparkles
+                        className={`h-4 w-4 ${
+                          onlinePowerUpsOn ? 'text-amber-400' : 'text-stone-500'
+                        }`}
+                      />
+                      <div>
+                        <div className="text-xs font-bold text-stone-100">
+                          Power-Ups (Ice Block & Burning Hand)
+                        </div>
+                        <div className="text-[11px] text-stone-400">
+                          {onlinePowerUpsOn
+                            ? 'Glowing ? blocks grant special abilities'
+                            : 'Classic wooden blocks only — no ? abilities'}
+                        </div>
+                      </div>
+                    </div>
+                    {isHost ? (
+                      <button
+                        type="button"
+                        onClick={() => onSetOnlinePowerUpsEnabled(!onlinePowerUpsOn)}
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-bold transition ${
+                          onlinePowerUpsOn
+                            ? 'border-emerald-400/70 bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30'
+                            : 'border-stone-700 bg-stone-800 text-stone-300 hover:bg-stone-700'
+                        }`}
+                      >
+                        {onlinePowerUpsOn ? 'ON' : 'OFF'}
+                      </button>
+                    ) : (
+                      <span
+                        className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold ${
+                          onlinePowerUpsOn
+                            ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                            : 'border-stone-700 bg-stone-800 text-stone-400'
+                        }`}
+                      >
+                        {onlinePowerUpsOn ? 'ON' : 'OFF'}
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
+
               <div>
                 <div className="mb-2 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-stone-400">
                   <span>Players at the Table ({roomState.players.length}/6)</span>
@@ -689,6 +744,37 @@ export function Lobby({
                     </button>
                   </div>
 
+                  <div className="flex items-center justify-between rounded-xl border border-stone-800 bg-stone-950/60 px-3.5 py-2">
+                    <div className="flex items-center gap-2.5">
+                      <Sparkles
+                        className={`h-4 w-4 ${
+                          localPowerUpsEnabled ? 'text-amber-400' : 'text-stone-500'
+                        }`}
+                      />
+                      <div>
+                        <div className="text-xs font-bold text-stone-100">
+                          Power-Ups (Ice Block & Burning Hand)
+                        </div>
+                        <div className="text-[11px] text-stone-400">
+                          {localPowerUpsEnabled
+                            ? 'Mystery ? blocks enabled'
+                            : 'Disabled (Classic wooden blocks only)'}
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setLocalPowerUpsEnabled((prev) => !prev)}
+                      className={`rounded-lg border px-3 py-1.5 text-xs font-bold transition ${
+                        localPowerUpsEnabled
+                          ? 'border-emerald-400/70 bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30'
+                          : 'border-stone-700 bg-stone-800 text-stone-300 hover:bg-stone-700'
+                      }`}
+                    >
+                      {localPowerUpsEnabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold uppercase tracking-wider text-stone-400">
                       Local Players ({localPlayers.length}/6)
@@ -737,7 +823,8 @@ export function Lobby({
                     onClick={() =>
                       onStartLocalGame(
                         localPlayers.map((n, i) => n.trim() || `Player ${i + 1}`),
-                        localRulesMode
+                        localRulesMode,
+                        localPowerUpsEnabled
                       )
                     }
                     className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-4 py-3 text-sm font-bold text-stone-950 shadow-lg shadow-amber-500/20 transition hover:brightness-110"

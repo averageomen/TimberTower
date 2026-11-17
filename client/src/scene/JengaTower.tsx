@@ -14,6 +14,7 @@ import {
   getValidTopPlacements,
   isBlockSelectable,
   PlacementSlot,
+  PowerUpType,
   Quat,
   RoomStatus,
   Vec3,
@@ -26,6 +27,8 @@ interface JengaTowerProps {
   status: RoomStatus;
   isMyTurn: boolean;
   activeBlockId: number | null;
+  powerUpTargeting: PowerUpType | null;
+  burningBlockId: number | null;
   remoteHoveredBlockId: number | null;
   remoteGrabbedBlockId: number | null;
   remotePhysicsFrames: React.MutableRefObject<Map<number, { pos: THREE.Vector3; quat: THREE.Quaternion }>>;
@@ -33,6 +36,7 @@ interface JengaTowerProps {
   cameraResetTrigger: number;
   onHoverBlock: (blockId: number | null) => void;
   onGrabBlock: (blockId: number, committed: boolean) => void;
+  onApplyPowerUp: (blockId: number) => void;
   onPlaceBlock: (
     blockId: number,
     finalTransform: { position: Vec3; quaternion: Quat },
@@ -254,6 +258,8 @@ function TowerPhysicsContent({
   status,
   isMyTurn,
   activeBlockId,
+  powerUpTargeting,
+  burningBlockId,
   remoteHoveredBlockId,
   remoteGrabbedBlockId,
   remotePhysicsFrames,
@@ -261,6 +267,7 @@ function TowerPhysicsContent({
   cameraResetTrigger,
   onHoverBlock,
   onGrabBlock,
+  onApplyPowerUp,
   onPlaceBlock,
   onPhysicsSync,
   onCollapse,
@@ -584,12 +591,19 @@ function TowerPhysicsContent({
       if (!isMyTurn || status !== 'PLAYING') return;
 
       setHoveredBlockId(blockId);
+      if (powerUpTargeting) {
+        gl.domElement.style.cursor = 'crosshair';
+        soundEngine.playHover(true);
+        onHoverBlock(blockId);
+        return;
+      }
+
       const legal = canInteractBlock(blockId) || stashedBlockId === blockId;
       gl.domElement.style.cursor = legal ? 'grab' : 'not-allowed';
       soundEngine.playHover(legal);
       onHoverBlock(legal ? blockId : null);
     },
-    [isMyTurn, status, canInteractBlock, stashedBlockId, gl.domElement, onHoverBlock]
+    [isMyTurn, status, powerUpTargeting, canInteractBlock, stashedBlockId, gl.domElement, onHoverBlock]
   );
 
   const handlePointerOut = useCallback(
@@ -606,6 +620,14 @@ function TowerPhysicsContent({
     (blockId: number, e: ThreeEvent<PointerEvent>) => {
       if (e.button !== 0) return;
       if (!isMyTurn || status !== 'PLAYING') return;
+
+      if (powerUpTargeting) {
+        soundEngine.unlock();
+        soundEngine.playSelect();
+        onApplyPowerUp(blockId);
+        gl.domElement.style.cursor = 'auto';
+        return;
+      }
 
       const isResumingStashed = stashedBlockId === blockId;
       if (!isResumingStashed && !canInteractBlock(blockId)) {
@@ -676,12 +698,14 @@ function TowerPhysicsContent({
     [
       isMyTurn,
       status,
+      powerUpTargeting,
       stashedBlockId,
       canInteractBlock,
       gl.domElement,
       validTopSlots,
       activeBlockId,
       onGrabBlock,
+      onApplyPowerUp,
     ]
   );
 
@@ -985,10 +1009,52 @@ function TowerPhysicsContent({
       }
     }
 
-    // 2. Wake sleeping blocks slightly when tower is disturbed & check tilt/fall collapse
+    // 2. Wake sleeping blocks slightly when tower is disturbed & check fall collapse
     if (isLocalSimulator && performance.now() > spawnProtectionUntilRef.current) {
+      // Amplify horizontal slip for blocks resting on an Ice Block
+      for (const iceBlock of blocks) {
+        if (iceBlock.isRemoved || iceBlock.effect !== 'ICE') continue;
+        const iceBody = bodyRefs.current.get(iceBlock.id);
+        if (!iceBody) continue;
+        const iceT = iceBody.translation();
+        const iceR = iceBody.rotation();
+        tempQuatA.set(iceR.x, iceR.y, iceR.z, iceR.w);
+        const iceExt = getWorldHalfExtents(tempQuatA);
+
+        for (const other of blocks) {
+          if (
+            other.id === iceBlock.id ||
+            other.isRemoved ||
+            dragSessionRef.current?.blockId === other.id
+          ) {
+            continue;
+          }
+          const otherBody = bodyRefs.current.get(other.id);
+          if (!otherBody) continue;
+          const otherT = otherBody.translation();
+          const otherR = otherBody.rotation();
+          tempQuatB.set(otherR.x, otherR.y, otherR.z, otherR.w);
+          const otherExt = getWorldHalfExtents(tempQuatB);
+
+          if (Math.abs(otherT.y - (iceT.y + iceExt.hy + otherExt.hy)) >= 0.28) {
+            continue;
+          }
+          const ox = iceExt.hx + otherExt.hx - Math.abs(otherT.x - iceT.x);
+          const oz = iceExt.hz + otherExt.hz - Math.abs(otherT.z - iceT.z);
+          if (ox > 0 && oz > 0) {
+            const ov = otherBody.linvel();
+            const speed = Math.hypot(ov.x, ov.z);
+            if (speed > 0.02 && speed < 4) {
+              otherBody.wakeUp();
+              otherBody.setLinvel({ x: ov.x * 1.06, y: ov.y, z: ov.z * 1.06 }, true);
+            }
+          }
+        }
+      }
+
       for (const block of blocks) {
         if (
+          block.isRemoved ||
           dragSessionRef.current?.blockId === block.id ||
           block.id === dragBlockId ||
           block.id === stashedBlockId
@@ -1143,7 +1209,9 @@ function TowerPhysicsContent({
 
       {blocks.map((block) => {
         const isHovered = hoveredBlockId === block.id && isMyTurn && status === 'PLAYING';
+        const isTargeting = Boolean(powerUpTargeting && isMyTurn && status === 'PLAYING');
         const isIllegalHover =
+          !isTargeting &&
           isHovered &&
           stashedBlockId !== block.id &&
           !canInteractBlock(block.id);
@@ -1162,6 +1230,8 @@ function TowerPhysicsContent({
               (!isMyTurn && remoteGrabbedBlockId === block.id)
             }
             isBeingDragged={dragBlockId === block.id || stashedBlockId === block.id}
+            isBurningActive={burningBlockId === block.id}
+            isTargetingPowerUp={isTargeting}
             registerBody={registerBody}
             onPointerOverBlock={handlePointerOver}
             onPointerOutBlock={handlePointerOut}

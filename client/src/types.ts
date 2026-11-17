@@ -10,6 +10,16 @@ export type GameMode = 'ONLINE' | 'LOCAL';
 
 export type GameRulesMode = 'CLASSIC' | 'ELIMINATION';
 
+export type PowerUpType = 'ICE_BLOCK' | 'BURNING_HAND';
+export type BlockEffectType = 'ICE' | 'BURN';
+
+export interface BurningBlockState {
+  blockId: number;
+  playerId: string;
+  startedAt: number;
+  durationMs: number;
+}
+
 export type Vec3 = [number, number, number];
 export type Quat = [number, number, number, number];
 
@@ -31,6 +41,7 @@ export interface Player {
   isHost: boolean;
   connected: boolean;
   eliminated?: boolean;
+  powerUp?: PowerUpType | null;
 }
 
 export interface BlockState {
@@ -40,12 +51,15 @@ export interface BlockState {
   position: Vec3;
   quaternion: Quat;
   isRemoved: boolean;
+  hasMysteryPowerUp?: boolean;
+  effect?: BlockEffectType | null;
 }
 
 export interface RoomState {
   roomId: string;
   status: RoomStatus;
   rulesMode: GameRulesMode;
+  powerUpsEnabled?: boolean;
   players: Player[];
   currentTurnIndex: number;
   startingPlayerIndex: number;
@@ -60,6 +74,7 @@ export interface RoomState {
   towerRestoreVersion: number;
   lastEliminatedPlayerId: string | null;
   lastEliminatedAt: number | null;
+  burningBlock?: BurningBlockState | null;
   winnerId: string | null;
   loserId: string | null;
   gameOverReason: GameOverReason;
@@ -93,6 +108,7 @@ export const TOTAL_BLOCKS = INITIAL_LAYERS * BLOCKS_PER_LAYER;
 
 export const TURN_DURATION_MS = 45_000;
 export const SETTLING_DURATION_MS = 3_000;
+export const BURN_DURATION_MS = 10_000;
 
 const EVEN_QUAT: Quat = [0, 0, 0, 1];
 const ODD_QUAT: Quat = [0, Math.SQRT1_2, 0, Math.SQRT1_2];
@@ -109,7 +125,61 @@ export function getLayerQuaternion(layer: number): Quat {
   return layer % 2 === 1 ? [...ODD_QUAT] : [...EVEN_QUAT];
 }
 
-export function createInitialBlocks(): BlockState[] {
+export function seedMysteryPowerUpBlocks(
+  blocks: BlockState[],
+  count = 7
+): BlockState[] {
+  const candidates = blocks.filter(
+    (b) =>
+      !b.isRemoved &&
+      !b.hasMysteryPowerUp &&
+      !b.effect &&
+      b.layer >= 1 &&
+      b.layer <= 14 &&
+      isBlockSelectable(blocks, b.id)
+  );
+  const chosenIds = new Set<number>();
+  const pool = [...candidates];
+  while (chosenIds.size < count && pool.length > 0) {
+    const idx = Math.floor(Math.random() * pool.length);
+    const [picked] = pool.splice(idx, 1);
+    if (picked) chosenIds.add(picked.id);
+  }
+  return blocks.map((b) =>
+    chosenIds.has(b.id) ? { ...b, hasMysteryPowerUp: true } : b
+  );
+}
+
+export function maybeSpawnMysteryBlock(blocks: BlockState[]): BlockState[] {
+  const activeMysteryCount = blocks.filter(
+    (b) => !b.isRemoved && b.hasMysteryPowerUp && isBlockSelectable(blocks, b.id)
+  ).length;
+  if (activeMysteryCount >= 5 || Math.random() >= 0.55) {
+    return blocks;
+  }
+  const candidates = blocks.filter(
+    (b) =>
+      !b.isRemoved &&
+      !b.hasMysteryPowerUp &&
+      !b.effect &&
+      isBlockSelectable(blocks, b.id)
+  );
+  if (candidates.length === 0) return blocks;
+  const picked = candidates[Math.floor(Math.random() * candidates.length)];
+  return blocks.map((b) =>
+    b.id === picked.id ? { ...b, hasMysteryPowerUp: true } : b
+  );
+}
+
+export function clearAllPowerUpsOnBlocks(blocks: BlockState[]): BlockState[] {
+  return blocks.map((b) => ({
+    ...b,
+    hasMysteryPowerUp: false,
+    effect: null,
+  }));
+}
+
+export function createInitialBlocks(spawnPowerUps = true): BlockState[] {
   const blocks: BlockState[] = [];
   for (let layer = 0; layer < INITIAL_LAYERS; layer++) {
     for (let slot = 0; slot < BLOCKS_PER_LAYER; slot++) {
@@ -121,10 +191,12 @@ export function createInitialBlocks(): BlockState[] {
         position: getSlotPosition(layer, slot),
         quaternion: getLayerQuaternion(layer),
         isRemoved: false,
+        hasMysteryPowerUp: false,
+        effect: null,
       });
     }
   }
-  return blocks;
+  return spawnPowerUps ? seedMysteryPowerUpBlocks(blocks, 7) : blocks;
 }
 
 export function cloneBlocks(blocks: BlockState[]): BlockState[] {
@@ -132,6 +204,8 @@ export function cloneBlocks(blocks: BlockState[]): BlockState[] {
     ...b,
     position: [b.position[0], b.position[1], b.position[2]],
     quaternion: [b.quaternion[0], b.quaternion[1], b.quaternion[2], b.quaternion[3]],
+    hasMysteryPowerUp: Boolean(b.hasMysteryPowerUp),
+    effect: b.effect ?? null,
   }));
 }
 

@@ -7,7 +7,8 @@ export type GlobalSoundEvent =
   | { type: 'SLIDE'; speed: number }
   | { type: 'STOP_SLIDE' }
   | { type: 'COLLAPSE' }
-  | { type: 'EXPLOSION' };
+  | { type: 'EXPLOSION' }
+  | { type: 'MC_BURN' };
 
 type SoundKey =
   | 'wood_tap'
@@ -18,6 +19,7 @@ type SoundKey =
   | 'explosion'
   | 'turn_chime'
   | 'tick'
+  | 'mc_burn'
   | 'emote_fire'
   | 'emote_clap'
   | 'emote_shock'
@@ -57,6 +59,10 @@ const SOUND_SOURCES: Record<SoundKey, { local: string; remote: string }> = {
   tick: {
     local: './sounds/tick.ogg',
     remote: 'https://actions.google.com/sounds/v1/alarms/beep_short.ogg',
+  },
+  mc_burn: {
+    local: './sounds/mc_burn.mp3',
+    remote: 'https://www.myinstants.com/media/sounds/minecraft-damage_OTtnom6.mp3',
   },
   emote_fire: {
     local: './sounds/emote_fire.mp3',
@@ -170,6 +176,9 @@ class SoundEngine {
         break;
       case 'EXPLOSION':
         this.playExplosion(false);
+        break;
+      case 'MC_BURN':
+        this.playBurnTick(false);
         break;
     }
   }
@@ -508,6 +517,13 @@ class SoundEngine {
 
   public playCountdownTick(): void {
     this.playBuffer('tick', 0.28, 1.1, 0, 0.18);
+  }
+
+  public playBurnTick(broadcast = false): void {
+    if (broadcast && this.broadcaster) {
+      this.broadcaster({ type: 'MC_BURN' });
+    }
+    this.playBuffer('mc_burn', 0.85, 1.0);
   }
 }
 

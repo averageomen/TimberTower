@@ -11,12 +11,16 @@ import {
 import { JengaTower } from './scene/JengaTower';
 import {
   BlockState,
+  BURN_DURATION_MS,
   ChatMessage,
+  clearAllPowerUpsOnBlocks,
   cloneBlocks,
   CompactBlockTuple,
   createInitialBlocks,
   GameMode,
   GameRulesMode,
+  maybeSpawnMysteryBlock,
+  PowerUpType,
   Quat,
   RoomState,
   sanitizeStableBlocks,
@@ -27,13 +31,15 @@ import {
 
 function createLocalRoomState(
   playerNames: string[],
-  rulesMode: GameRulesMode
+  rulesMode: GameRulesMode,
+  powerUpsEnabled = true
 ): RoomState {
-  const initialBlocks = createInitialBlocks();
+  const initialBlocks = createInitialBlocks(powerUpsEnabled);
   return {
     roomId: 'LOCAL',
     status: 'PLAYING',
     rulesMode,
+    powerUpsEnabled,
     players: playerNames.map((name, idx) => ({
       id: `local-${idx}`,
       name,
@@ -55,6 +61,7 @@ function createLocalRoomState(
     towerRestoreVersion: 1,
     lastEliminatedPlayerId: null,
     lastEliminatedAt: null,
+    burningBlock: null,
     winnerId: null,
     loserId: null,
     gameOverReason: null,
@@ -101,15 +108,17 @@ export default function App() {
   const [cameraResetTrigger, setCameraResetTrigger] = useState(0);
   const [muted, setMuted] = useState(false);
   const [emoteMuted, setEmoteMuted] = useState(false);
+  const [powerUpTargeting, setPowerUpTargeting] = useState<PowerUpType | null>(null);
 
   const remotePhysicsFrames = useRef<
     Map<number, { pos: THREE.Vector3; quat: THREE.Quaternion }>
   >(new Map());
   const localTurnTimeoutRef = useRef<number | null>(null);
   const localSettlingTimeoutRef = useRef<number | null>(null);
+  const localBurnTimeoutRef = useRef<number | null>(null);
   const reactionTimeoutsRef = useRef<number[]>([]);
   const prevTurnMarkerRef = useRef<string | null>(null);
-  const lastExplosionAtRef = useRef<number | null>(null);
+  const lastExplosionAtRef = useRef<string | null>(null);
   const prevMovesStateRef = useRef<{ roomId: string; moves: number } | null>(null);
   const prevCollapseGameOverRef = useRef<string | null>(null);
   const latestLocalSimTransformsRef = useRef<Map<number, { position: Vec3; quaternion: Quat }>>(
@@ -126,6 +135,10 @@ export default function App() {
     if (localSettlingTimeoutRef.current !== null) {
       window.clearTimeout(localSettlingTimeoutRef.current);
       localSettlingTimeoutRef.current = null;
+    }
+    if (localBurnTimeoutRef.current !== null) {
+      window.clearTimeout(localBurnTimeoutRef.current);
+      localBurnTimeoutRef.current = null;
     }
   }, []);
 
@@ -246,15 +259,20 @@ export default function App() {
     }
   }, [activeRoomState]);
 
-  // Trigger explosion & Lego collapse audio when a player is eliminated in Elimination Tower mode
+  // Trigger explosion & Lego collapse audio once per elimination event
+  const elimAudioKey = activeRoomState?.lastEliminatedPlayerId
+    ? `${activeRoomState.roomId}-${activeRoomState.towerRestoreVersion}-${activeRoomState.lastEliminatedPlayerId}-${activeRoomState.status === 'GAME_OVER' ? 'end' : 'play'}`
+    : null;
+
   useEffect(() => {
-    const eliminatedAt = activeRoomState?.lastEliminatedAt ?? null;
-    if (eliminatedAt && eliminatedAt !== lastExplosionAtRef.current) {
-      lastExplosionAtRef.current = eliminatedAt;
+    if (elimAudioKey && elimAudioKey !== lastExplosionAtRef.current) {
+      lastExplosionAtRef.current = elimAudioKey;
       soundEngine.playCollapse(false);
       soundEngine.playExplosion(false);
+    } else if (!elimAudioKey) {
+      lastExplosionAtRef.current = null;
     }
-  }, [activeRoomState?.lastEliminatedAt]);
+  }, [elimAudioKey]);
 
   // State-sync fallback for global tower collapse and block placement audio across all clients
   useEffect(() => {
@@ -316,9 +334,12 @@ export default function App() {
       const now = Date.now();
 
       if (prev.rulesMode === 'ELIMINATION' && alivePlayers.length >= 2) {
+        const powerUpsOn = prev.powerUpsEnabled !== false;
         const restored = sanitizeStableBlocks(
-          prev.lastStableBlocks.length > 0 ? prev.lastStableBlocks : createInitialBlocks(),
-          createInitialBlocks()
+          prev.lastStableBlocks.length > 0
+            ? prev.lastStableBlocks
+            : createInitialBlocks(powerUpsOn),
+          createInitialBlocks(powerUpsOn)
         );
         const nextTurn = findNextAliveLocalIndex(updatedPlayers, prev.currentTurnIndex);
         latestLocalSimTransformsRef.current.clear();
@@ -330,6 +351,7 @@ export default function App() {
           turnStartedAt: now,
           settlingStartedAt: null,
           activeBlockId: null,
+          burningBlock: null,
           blocks: restored,
           lastStableBlocks: cloneBlocks(restored),
           towerRestoreVersion: prev.towerRestoreVersion + 1,
@@ -350,9 +372,12 @@ export default function App() {
       return {
         ...prev,
         status: 'GAME_OVER',
-        players: updatedPlayers,
+        players: updatedPlayers.map((p) => ({ ...p, powerUp: null })),
+        blocks: clearAllPowerUpsOnBlocks(prev.blocks),
+        lastStableBlocks: clearAllPowerUpsOnBlocks(prev.lastStableBlocks),
         settlingStartedAt: null,
         activeBlockId: null,
+        burningBlock: null,
         lastEliminatedPlayerId: prev.rulesMode === 'ELIMINATION' ? loser?.id ?? null : null,
         lastEliminatedAt: prev.rulesMode === 'ELIMINATION' ? now : null,
         loserId: loser?.id ?? null,
@@ -411,6 +436,76 @@ export default function App() {
     applyLocalElimination,
   ]);
 
+  // Local mode 10s Burning Hand block countdown timer
+  useEffect(() => {
+    if (localBurnTimeoutRef.current !== null) {
+      window.clearTimeout(localBurnTimeoutRef.current);
+      localBurnTimeoutRef.current = null;
+    }
+
+    if (
+      mode !== 'LOCAL' ||
+      !localRoomState ||
+      localRoomState.status !== 'PLAYING' ||
+      !localRoomState.burningBlock
+    ) {
+      return;
+    }
+
+    const burning = localRoomState.burningBlock;
+    const elapsed = Date.now() - burning.startedAt;
+    const remaining = Math.max(0, burning.durationMs - elapsed);
+
+    localBurnTimeoutRef.current = window.setTimeout(() => {
+      const currentPlayer = localRoomState.players[localRoomState.currentTurnIndex];
+      setLocalRoomState((prev) => {
+        if (!prev || prev.status !== 'PLAYING' || !prev.burningBlock) return prev;
+        return {
+          ...prev,
+          blocks: prev.blocks.map((b) =>
+            b.id === burning.blockId
+              ? { ...b, isRemoved: true, effect: null, hasMysteryPowerUp: false }
+              : b
+          ),
+          lastStableBlocks: prev.lastStableBlocks.map((b) =>
+            b.id === burning.blockId
+              ? { ...b, effect: null, hasMysteryPowerUp: false }
+              : b
+          ),
+          burningBlock: null,
+        };
+      });
+      applyLocalElimination('COLLAPSE');
+      setChatMessages((prev) => [
+        ...prev.slice(-60),
+        {
+          id: `burn-${Date.now()}`,
+          senderId: 'system',
+          senderName: 'Jenga Referee',
+          message:
+            localRoomState.rulesMode === 'ELIMINATION'
+              ? `🔥 ${currentPlayer?.name ?? 'Player'}'s block burned away and they were ELIMINATED!`
+              : `🔥 ${currentPlayer?.name ?? 'Player'}'s block burned to ash! Game Over!`,
+          emoji: '🔥',
+          system: true,
+          timestamp: Date.now(),
+        },
+      ]);
+    }, remaining);
+
+    return () => {
+      if (localBurnTimeoutRef.current !== null) {
+        window.clearTimeout(localBurnTimeoutRef.current);
+        localBurnTimeoutRef.current = null;
+      }
+    };
+  }, [
+    mode,
+    localRoomState?.status,
+    localRoomState?.burningBlock,
+    applyLocalElimination,
+  ]);
+
   const handleCreateOnlineRoom = (playerName: string) => {
     soundEngine.unlock();
     setMode('ONLINE');
@@ -444,7 +539,15 @@ export default function App() {
     void supabaseMultiplayer.setRulesMode(rulesMode);
   };
 
-  const handleStartLocalGame = (playerNames: string[], rulesMode: GameRulesMode) => {
+  const handleSetOnlinePowerUpsEnabled = (enabled: boolean) => {
+    void supabaseMultiplayer.setPowerUpsEnabled(enabled);
+  };
+
+  const handleStartLocalGame = (
+    playerNames: string[],
+    rulesMode: GameRulesMode,
+    powerUpsEnabled: boolean
+  ) => {
     soundEngine.unlock();
     clearLocalTimers();
     latestLocalSimTransformsRef.current.clear();
@@ -463,7 +566,7 @@ export default function App() {
         timestamp: Date.now(),
       },
     ]);
-    setLocalRoomState(createLocalRoomState(playerNames, rulesMode));
+    setLocalRoomState(createLocalRoomState(playerNames, rulesMode, powerUpsEnabled));
     setMatchResetVersion((v) => v + 1);
   };
 
@@ -478,12 +581,102 @@ export default function App() {
   const handleGrabBlock = useCallback(
     (blockId: number, committed: boolean) => {
       if (mode === 'LOCAL') {
-        if (committed) {
-          setLocalRoomState((prev) =>
-            prev && prev.activeBlockId === null
-              ? { ...prev, activeBlockId: blockId }
-              : prev
-          );
+        if (!committed || !localRoomState || localRoomState.status !== 'PLAYING') return;
+
+        const activePlayer = localRoomState.players[localRoomState.currentTurnIndex];
+        const target = localRoomState.blocks.find((b) => b.id === blockId);
+        const powerUpsOn = localRoomState.powerUpsEnabled !== false;
+        const collected = powerUpsOn && Boolean(target?.hasMysteryPowerUp);
+        const grantedPowerUp: PowerUpType | null = collected
+          ? Math.random() < 0.5
+            ? 'ICE_BLOCK'
+            : 'BURNING_HAND'
+          : null;
+        const startedBurn = Boolean(
+          powerUpsOn &&
+            target?.effect === 'BURN' &&
+            localRoomState.burningBlock?.blockId !== blockId
+        );
+
+        if (
+          localRoomState.activeBlockId === blockId &&
+          !collected &&
+          !startedBurn
+        ) {
+          return;
+        }
+
+        setLocalRoomState((prev) => {
+          if (!prev || prev.status !== 'PLAYING') return prev;
+          const prevTarget = prev.blocks.find((b) => b.id === blockId);
+          const prevPowerUpsOn = prev.powerUpsEnabled !== false;
+          const canCollect =
+            prevPowerUpsOn && Boolean(prevTarget?.hasMysteryPowerUp) && grantedPowerUp;
+          const canBurn =
+            prevPowerUpsOn &&
+            prevTarget?.effect === 'BURN' &&
+            prev.burningBlock?.blockId !== blockId;
+
+          return {
+            ...prev,
+            activeBlockId: prev.activeBlockId ?? blockId,
+            lastEliminatedPlayerId: null,
+            lastEliminatedAt: null,
+            players: canCollect
+              ? prev.players.map((p, idx) =>
+                  idx === prev.currentTurnIndex ? { ...p, powerUp: grantedPowerUp } : p
+                )
+              : prev.players,
+            blocks: canCollect
+              ? prev.blocks.map((b) =>
+                  b.id === blockId ? { ...b, hasMysteryPowerUp: false } : b
+                )
+              : prev.blocks,
+            lastStableBlocks: canCollect
+              ? prev.lastStableBlocks.map((b) =>
+                  b.id === blockId ? { ...b, hasMysteryPowerUp: false } : b
+                )
+              : prev.lastStableBlocks,
+            burningBlock: canBurn
+              ? {
+                  blockId,
+                  playerId: prev.players[prev.currentTurnIndex]?.id ?? 'local',
+                  startedAt: Date.now(),
+                  durationMs: BURN_DURATION_MS,
+                }
+              : prev.burningBlock ?? null,
+          };
+        });
+
+        if (grantedPowerUp) {
+          const icon = grantedPowerUp === 'ICE_BLOCK' ? '🧊' : '🔥';
+          const label = grantedPowerUp === 'ICE_BLOCK' ? 'Ice Block' : 'Burning Hand';
+          setChatMessages((prev) => [
+            ...prev.slice(-60),
+            {
+              id: `pw-${Date.now()}`,
+              senderId: 'system',
+              senderName: 'Jenga Referee',
+              message: `${activePlayer?.name ?? 'Player'} unlocked ${icon} ${label} from a Mystery Block!`,
+              emoji: icon,
+              system: true,
+              timestamp: Date.now(),
+            },
+          ]);
+        }
+        if (startedBurn) {
+          setChatMessages((prev) => [
+            ...prev.slice(-60),
+            {
+              id: `burn-start-${Date.now()}`,
+              senderId: 'system',
+              senderName: 'Jenga Referee',
+              message: `🔥 ${activePlayer?.name ?? 'Player'} picked up a BURNING block! Place it within 10s!`,
+              emoji: '🔥',
+              system: true,
+              timestamp: Date.now(),
+            },
+          ]);
         }
         return;
       }
@@ -491,7 +684,82 @@ export default function App() {
       if (!onlineRoomState) return;
       supabaseMultiplayer.grabBlock(blockId, committed);
     },
-    [mode, onlineRoomState]
+    [mode, localRoomState, onlineRoomState]
+  );
+
+  const handleApplyPowerUp = useCallback(
+    (blockId: number) => {
+      setPowerUpTargeting(null);
+      if (mode === 'LOCAL') {
+        if (
+          !localRoomState ||
+          localRoomState.status !== 'PLAYING' ||
+          localRoomState.powerUpsEnabled === false
+        ) {
+          return;
+        }
+        const activePlayer = localRoomState.players[localRoomState.currentTurnIndex];
+        const powerUp = activePlayer?.powerUp ?? null;
+        if (!powerUp) return;
+
+        const targetBlock = localRoomState.blocks.find((b) => b.id === blockId);
+        if (!targetBlock || targetBlock.isRemoved) return;
+
+        const nextEffect: 'ICE' | 'BURN' = powerUp === 'ICE_BLOCK' ? 'ICE' : 'BURN';
+        setLocalRoomState((prev) => {
+          if (!prev || prev.status !== 'PLAYING') return prev;
+          const activeIdx = prev.currentTurnIndex;
+          const curActive = prev.players[activeIdx];
+          if (!curActive?.powerUp) return prev;
+          const startNow = nextEffect === 'BURN' && prev.activeBlockId === blockId;
+          return {
+            ...prev,
+            lastEliminatedPlayerId: null,
+            lastEliminatedAt: null,
+            players: prev.players.map((p, idx) =>
+              idx === activeIdx ? { ...p, powerUp: null } : p
+            ),
+            blocks: prev.blocks.map((b) =>
+              b.id === blockId ? { ...b, effect: nextEffect, hasMysteryPowerUp: false } : b
+            ),
+            lastStableBlocks: prev.lastStableBlocks.map((b) =>
+              b.id === blockId ? { ...b, effect: nextEffect, hasMysteryPowerUp: false } : b
+            ),
+            burningBlock: startNow
+              ? {
+                  blockId,
+                  playerId: curActive.id,
+                  startedAt: Date.now(),
+                  durationMs: BURN_DURATION_MS,
+                }
+              : prev.burningBlock ?? null,
+          };
+        });
+
+        const icon = powerUp === 'ICE_BLOCK' ? '🧊' : '🔥';
+        const msg =
+          powerUp === 'ICE_BLOCK'
+            ? `🧊 ${activePlayer?.name ?? 'Player'} froze Block #${blockId + 1} with Ice Block!`
+            : `🔥 ${activePlayer?.name ?? 'Player'} cursed Block #${blockId + 1} with Burning Hand!`;
+        setChatMessages((prev) => [
+          ...prev.slice(-60),
+          {
+            id: `use-pw-${Date.now()}`,
+            senderId: 'system',
+            senderName: 'Jenga Referee',
+            message: msg,
+            emoji: icon,
+            system: true,
+            timestamp: Date.now(),
+          },
+        ]);
+        return;
+      }
+
+      if (!onlineRoomState) return;
+      void supabaseMultiplayer.usePowerUp(blockId);
+    },
+    [mode, localRoomState, onlineRoomState]
   );
 
   const handlePlaceBlock = useCallback(
@@ -515,6 +783,7 @@ export default function App() {
                   slot: targetSlot,
                   position: finalTransform.position,
                   quaternion: finalTransform.quaternion,
+                  effect: null,
                 }
               : b
           );
@@ -524,6 +793,9 @@ export default function App() {
             status: 'SETTLING',
             settlingStartedAt: Date.now(),
             activeBlockId: null,
+            burningBlock: null,
+            lastEliminatedPlayerId: null,
+            lastEliminatedAt: null,
             blocksMovedCount: prev.blocksMovedCount + 1,
             players: nextPlayers,
             blocks: nextBlocks,
@@ -542,16 +814,21 @@ export default function App() {
                 ? { ...b, position: live.position, quaternion: live.quaternion }
                 : b;
             });
-            const settledBlocks = sanitizeStableBlocks(
+            const sanitized = sanitizeStableBlocks(
               candidateBlocks,
               prev.lastStableBlocks
             );
+            const powerUpsOn = prev.powerUpsEnabled !== false;
+            const settledBlocks = powerUpsOn
+              ? maybeSpawnMysteryBlock(sanitized)
+              : sanitized;
             return {
               ...prev,
               status: 'PLAYING',
               settlingStartedAt: null,
               turnStartedAt: Date.now(),
               currentTurnIndex: findNextAliveLocalIndex(prev.players, prev.currentTurnIndex),
+              burningBlock: null,
               blocks: cloneBlocks(settledBlocks),
               lastStableBlocks: cloneBlocks(settledBlocks),
             };
@@ -626,7 +903,7 @@ export default function App() {
       setLocalRoomState((prev) => {
         if (!prev) return prev;
         const nextStarter = (prev.startingPlayerIndex + 1) % prev.players.length;
-        const freshBlocks = createInitialBlocks();
+        const freshBlocks = createInitialBlocks(prev.powerUpsEnabled !== false);
         return {
           ...prev,
           status: 'PLAYING',
@@ -636,12 +913,18 @@ export default function App() {
           settlingStartedAt: null,
           activeBlockId: null,
           blocksMovedCount: 0,
-          players: prev.players.map((p) => ({ ...p, score: 0, eliminated: false })),
+          players: prev.players.map((p) => ({
+            ...p,
+            score: 0,
+            eliminated: false,
+            powerUp: null,
+          })),
           blocks: freshBlocks,
           lastStableBlocks: cloneBlocks(freshBlocks),
           towerRestoreVersion: prev.towerRestoreVersion + 1,
           lastEliminatedPlayerId: null,
           lastEliminatedAt: null,
+          burningBlock: null,
           winnerId: null,
           loserId: null,
           gameOverReason: null,
@@ -713,7 +996,7 @@ export default function App() {
     });
   }, []);
 
-  const showcaseBlocks = useMemo(() => createInitialBlocks(), []);
+  const showcaseBlocks = useMemo(() => createInitialBlocks(false), []);
   const sceneBlocks = activeRoomState ? activeRoomState.blocks : showcaseBlocks;
   const sceneStatus = activeRoomState ? activeRoomState.status : 'WAITING';
 
@@ -725,6 +1008,12 @@ export default function App() {
     const activePlayer = activeRoomState.players[activeRoomState.currentTurnIndex];
     return Boolean(mySocketId && activePlayer?.id === mySocketId);
   }, [activeRoomState, mode, mySocketId]);
+
+  useEffect(() => {
+    if (!isMyTurn || activeRoomState?.status !== 'PLAYING') {
+      setPowerUpTargeting(null);
+    }
+  }, [isMyTurn, activeRoomState?.status]);
 
   const showLobby = !activeRoomState || activeRoomState.status === 'WAITING';
 
@@ -742,6 +1031,8 @@ export default function App() {
             status={sceneStatus}
             isMyTurn={isMyTurn}
             activeBlockId={activeRoomState?.activeBlockId ?? null}
+            powerUpTargeting={powerUpTargeting}
+            burningBlockId={activeRoomState?.burningBlock?.blockId ?? null}
             remoteHoveredBlockId={remoteHoveredBlockId}
             remoteGrabbedBlockId={remoteGrabbedBlockId}
             remotePhysicsFrames={remotePhysicsFrames}
@@ -749,6 +1040,7 @@ export default function App() {
             cameraResetTrigger={cameraResetTrigger}
             onHoverBlock={handleHoverBlock}
             onGrabBlock={handleGrabBlock}
+            onApplyPowerUp={handleApplyPowerUp}
             onPlaceBlock={handlePlaceBlock}
             onPhysicsSync={handlePhysicsSync}
             onCollapse={handleCollapse}
@@ -768,6 +1060,7 @@ export default function App() {
           onToggleMute={handleToggleMute}
           onSaveSupabaseConfig={handleSaveSupabaseConfig}
           onSetOnlineRulesMode={handleSetOnlineRulesMode}
+          onSetOnlinePowerUpsEnabled={handleSetOnlinePowerUpsEnabled}
           onCreateOnlineRoom={handleCreateOnlineRoom}
           onJoinOnlineRoom={handleJoinOnlineRoom}
           onStartOnlineGame={handleStartOnlineGame}
@@ -786,6 +1079,24 @@ export default function App() {
           floatingReactions={floatingReactions}
           muted={muted}
           emoteMuted={emoteMuted}
+          powerUpTargeting={powerUpTargeting}
+          onTogglePowerUpTargeting={() => {
+            const activePlayer = activeRoomState.players[activeRoomState.currentTurnIndex];
+            const myPlayer =
+              mode === 'LOCAL'
+                ? activePlayer
+                : activeRoomState.players.find((p) => p.id === mySocketId);
+            if (
+              !isMyTurn ||
+              activeRoomState.status !== 'PLAYING' ||
+              activeRoomState.powerUpsEnabled === false ||
+              !myPlayer?.powerUp
+            ) {
+              setPowerUpTargeting(null);
+              return;
+            }
+            setPowerUpTargeting((prev) => (prev ? null : myPlayer.powerUp ?? null));
+          }}
           onToggleMute={handleToggleMute}
           onToggleEmoteMute={handleToggleEmoteMute}
           onResetCamera={() => setCameraResetTrigger((v) => v + 1)}

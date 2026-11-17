@@ -21,6 +21,7 @@ import {
   ChatMessage,
   GameMode,
   getHighestOccupiedLayer,
+  PowerUpType,
   RoomState,
 } from '../types';
 
@@ -37,6 +38,8 @@ interface GameHUDProps {
   }>;
   muted: boolean;
   emoteMuted: boolean;
+  powerUpTargeting: PowerUpType | null;
+  onTogglePowerUpTargeting: () => void;
   onToggleMute: () => void;
   onToggleEmoteMute: () => void;
   onResetCamera: () => void;
@@ -55,6 +58,8 @@ export function GameHUD({
   floatingReactions,
   muted,
   emoteMuted,
+  powerUpTargeting,
+  onTogglePowerUpTargeting,
   onToggleMute,
   onToggleEmoteMute,
   onResetCamera,
@@ -71,7 +76,8 @@ export function GameHUD({
   const [copiedCode, setCopiedCode] = useState(false);
   const [eliminationBanner, setEliminationBanner] = useState<string | null>(null);
   const lastTickSecondRef = useRef<number | null>(null);
-  const lastElimShownRef = useRef<number | null>(null);
+  const lastBurnTickSecondRef = useRef<number | null>(null);
+  const lastElimShownRef = useRef<string | null>(null);
   const elimShownLocalAtRef = useRef<number>(0);
   const elimBannerTimeoutRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
@@ -85,9 +91,12 @@ export function GameHUD({
     };
   }, []);
 
+  const elimKey = roomState.lastEliminatedPlayerId
+    ? `${roomState.roomId}-${roomState.towerRestoreVersion}-${roomState.lastEliminatedPlayerId}`
+    : null;
+
   useEffect(() => {
-    const elimAt = roomState.lastEliminatedAt;
-    if (!elimAt) {
+    if (!elimKey) {
       lastElimShownRef.current = null;
       setEliminationBanner(null);
       if (elimBannerTimeoutRef.current !== null) {
@@ -96,8 +105,8 @@ export function GameHUD({
       }
       return;
     }
-    if (elimAt === lastElimShownRef.current) return;
-    lastElimShownRef.current = elimAt;
+    if (elimKey === lastElimShownRef.current) return;
+    lastElimShownRef.current = elimKey;
     elimShownLocalAtRef.current =
       mode === 'ONLINE' ? supabaseMultiplayer.getServerNow() : Date.now();
 
@@ -113,7 +122,7 @@ export function GameHUD({
       setEliminationBanner(null);
       elimBannerTimeoutRef.current = null;
     }, 3000);
-  }, [mode, roomState.lastEliminatedAt, roomState.lastEliminatedPlayerId, roomState.players]);
+  }, [mode, elimKey, roomState.lastEliminatedPlayerId, roomState.players]);
 
   useEffect(() => {
     setNowMs(mode === 'ONLINE' ? supabaseMultiplayer.getServerNow() : Date.now());
@@ -155,6 +164,28 @@ export function GameHUD({
       : 0;
   const settlingSec = (settlingRemainingMs / 1000).toFixed(1);
 
+  const burnBlock = roomState.burningBlock;
+  const burnElapsedMs =
+    burnBlock && roomState.status === 'PLAYING'
+      ? Math.max(0, nowMs - burnBlock.startedAt)
+      : 0;
+  const burnRemainingMs =
+    burnBlock && roomState.status === 'PLAYING'
+      ? Math.min(burnBlock.durationMs, Math.max(0, burnBlock.durationMs - burnElapsedMs))
+      : 0;
+  const burnRemainingSec = burnRemainingMs > 0 ? Math.ceil(burnRemainingMs / 1000) : 0;
+
+  useEffect(() => {
+    if (roomState.status !== 'PLAYING' || !roomState.burningBlock || burnRemainingSec <= 0) {
+      lastBurnTickSecondRef.current = null;
+      return;
+    }
+    if (lastBurnTickSecondRef.current !== burnRemainingSec) {
+      lastBurnTickSecondRef.current = burnRemainingSec;
+      soundEngine.playBurnTick(false);
+    }
+  }, [roomState.status, roomState.burningBlock, burnRemainingSec]);
+
   useEffect(() => {
     if (roomState.status !== 'PLAYING') {
       lastTickSecondRef.current = null;
@@ -167,6 +198,11 @@ export function GameHUD({
   }, [roomState.status, turnRemainingSec]);
 
   const { highestLayer } = getHighestOccupiedLayer(roomState.blocks);
+  const myPlayer =
+    mode === 'LOCAL'
+      ? activePlayer
+      : roomState.players.find((p) => p.id === mySocketId);
+  const myPowerUp = myPlayer?.powerUp ?? null;
   const winner = roomState.players.find((p) => p.id === roomState.winnerId);
   const loser = roomState.players.find((p) => p.id === roomState.loserId);
 
@@ -380,6 +416,23 @@ export function GameHUD({
         </div>
       )}
 
+      {/* Center Overlay: 10s Burning Hand Block Countdown */}
+      {roomState.status === 'PLAYING' && burnBlock && burnRemainingSec > 0 && (
+        <div className="pointer-events-none flex items-center justify-center">
+          <div className="animate-pulse rounded-2xl border border-red-500/80 bg-red-950/90 px-6 py-3.5 text-center shadow-2xl shadow-red-950/60 backdrop-blur-md">
+            <div className="text-xs font-bold uppercase tracking-[0.2em] text-orange-300">
+              🔥 Burning Block!
+            </div>
+            <div className="mt-0.5 font-mono text-3xl font-extrabold text-red-100">
+              {burnRemainingSec}s
+            </div>
+            <div className="mt-0.5 text-xs text-red-200/85">
+              Place it on top before it burns away!
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Center Overlay: Elimination Blast Alert */}
       {eliminationBanner &&
         roomState.status !== 'GAME_OVER' &&
@@ -455,6 +508,67 @@ export function GameHUD({
             <span>{emoteMuted ? 'Emotes Muted' : 'Emote SFX'}</span>
           </button>
         </div>
+
+        {/* Bottom Center: Power-Up Inventory Slot */}
+        {roomState.powerUpsEnabled !== false && (
+          <div className="pointer-events-auto flex items-center">
+            {myPowerUp ? (
+              <div
+                className={`flex items-center gap-3 rounded-2xl border px-3 py-2 shadow-xl backdrop-blur-md transition ${
+                  powerUpTargeting
+                    ? 'border-violet-400/80 bg-violet-950/85 shadow-violet-500/20'
+                    : 'border-amber-500/40 bg-stone-900/90'
+                }`}
+              >
+                <img
+                  src={
+                    myPowerUp === 'ICE_BLOCK'
+                      ? './icons/ice_block.png'
+                      : './icons/burning_hand.png'
+                  }
+                  alt={myPowerUp === 'ICE_BLOCK' ? 'Ice Block' : 'Burning Hand'}
+                  className="h-11 w-11 rounded-xl border border-stone-700/80 object-cover shadow"
+                />
+                <div className="min-w-[140px]">
+                  <div className="text-xs font-bold text-amber-100">
+                    {myPowerUp === 'ICE_BLOCK' ? 'Ice Block' : 'Burning Hand'}
+                  </div>
+                  <div className="text-[11px] text-stone-300">
+                    {powerUpTargeting
+                      ? 'Click any block on tower'
+                      : myPowerUp === 'ICE_BLOCK'
+                        ? 'Make a block slippery'
+                        : 'Ignite a block (10s)'}
+                  </div>
+                </div>
+                {isMyTurn && roomState.status === 'PLAYING' ? (
+                  <button
+                    type="button"
+                    onClick={onTogglePowerUpTargeting}
+                    className={`rounded-xl px-3 py-1.5 text-xs font-bold transition ${
+                      powerUpTargeting
+                        ? 'bg-red-500/80 text-white hover:bg-red-500'
+                        : 'bg-gradient-to-r from-amber-400 to-orange-400 text-stone-950 hover:brightness-110'
+                    }`}
+                  >
+                    {powerUpTargeting ? 'Cancel' : 'Use'}
+                  </button>
+                ) : (
+                  <span className="rounded-xl bg-stone-800/80 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-stone-400">
+                    Your Turn Only
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="hidden items-center gap-2 rounded-2xl border border-dashed border-stone-700/80 bg-stone-900/65 px-3.5 py-2 text-xs text-stone-400 backdrop-blur-md md:flex">
+                <span className="flex h-7 w-7 items-center justify-center rounded-lg border border-amber-400/40 bg-amber-950/60 font-bold text-amber-300">
+                  ?
+                </span>
+                <span>Pull glowing blocks for Power-Ups</span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Chat Drawer */}
         <div className="pointer-events-auto flex flex-col items-end">

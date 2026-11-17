@@ -2,14 +2,18 @@ import { createClient, RealtimeChannel, SupabaseClient } from '@supabase/supabas
 import { customAlphabet, nanoid } from 'nanoid';
 import { GlobalSoundEvent } from '../audio/soundEngine';
 import {
+  BURN_DURATION_MS,
   ChatMessage,
+  clearAllPowerUpsOnBlocks,
   cloneBlocks,
   CompactBlockTuple,
   createInitialBlocks,
   GameRulesMode,
   getValidTopPlacements,
   isBlockSelectable,
+  maybeSpawnMysteryBlock,
   Player,
+  PowerUpType,
   Quat,
   RoomState,
   sanitizeStableBlocks,
@@ -147,6 +151,7 @@ class SupabaseRoomController {
 
   private turnTimeoutId: number | null = null;
   private settlingTimeoutId: number | null = null;
+  private burnTimeoutId: number | null = null;
   private disconnectTimers = new Map<string, number>();
   private lastRestoreOrCollapseAt = 0;
   private serverTimeOffsetMs = 0;
@@ -249,22 +254,11 @@ class SupabaseRoomController {
       this.callbacks?.onConnectionChange(false);
       return;
     }
-    const t0 = Date.now();
-    const { data, error } = await this.client
-      .from('jenga_rooms')
-      .select('room_id, updated_at')
-      .order('updated_at', { ascending: false })
-      .limit(1);
-    const t1 = Date.now();
+    const { error } = await this.client.from('jenga_rooms').select('room_id').limit(1);
     if (error) {
       this.callbacks?.onConnectionChange(false);
       this.callbacks?.onError(`Supabase connection check failed: ${error.message}`);
       return;
-    }
-    if (Array.isArray(data) && data[0]?.updated_at && !this.hasSyncedServerClock) {
-      // Initial rough check before RPC clock sync completes
-      void t0;
-      void t1;
     }
     void this.syncServerClock();
     this.callbacks?.onConnectionChange(true);
@@ -278,6 +272,10 @@ class SupabaseRoomController {
     if (this.settlingTimeoutId !== null) {
       window.clearTimeout(this.settlingTimeoutId);
       this.settlingTimeoutId = null;
+    }
+    if (this.burnTimeoutId !== null) {
+      window.clearTimeout(this.burnTimeoutId);
+      this.burnTimeoutId = null;
     }
     for (const timer of this.disconnectTimers.values()) {
       window.clearTimeout(timer);
@@ -302,6 +300,10 @@ class SupabaseRoomController {
       window.clearTimeout(this.settlingTimeoutId);
       this.settlingTimeoutId = null;
     }
+    if (this.burnTimeoutId !== null) {
+      window.clearTimeout(this.burnTimeoutId);
+      this.burnTimeoutId = null;
+    }
 
     const isCoord = this.isCoordinator();
     const activePlayer = state.players[state.currentTurnIndex];
@@ -321,6 +323,17 @@ class SupabaseRoomController {
       this.turnTimeoutId = window.setTimeout(() => {
         void this.handleTurnTimeout(!isCoord);
       }, remaining + backupDelayMs);
+
+      if (state.burningBlock) {
+        const burnElapsed = Math.max(0, serverNow - state.burningBlock.startedAt);
+        const burnRemaining = Math.min(
+          state.burningBlock.durationMs,
+          Math.max(0, state.burningBlock.durationMs - burnElapsed)
+        );
+        this.burnTimeoutId = window.setTimeout(() => {
+          void this.handleBurnTimeout(!isCoord);
+        }, burnRemaining + backupDelayMs);
+      }
     } else if (state.status === 'SETTLING' && state.settlingStartedAt) {
       const elapsed = Math.max(0, serverNow - state.settlingStartedAt);
       const remaining = Math.min(
@@ -331,6 +344,54 @@ class SupabaseRoomController {
         void this.completeSettlingPhase(!isCoord);
       }, remaining + backupDelayMs);
     }
+  }
+
+  private async handleBurnTimeout(allowBackup = false): Promise<void> {
+    if (
+      !this.roomState ||
+      this.roomState.status !== 'PLAYING' ||
+      !this.roomState.burningBlock ||
+      (!this.isCoordinator() && !allowBackup)
+    ) {
+      return;
+    }
+
+    const burnBlockId = this.roomState.burningBlock.blockId;
+    const active = this.roomState.players[this.roomState.currentTurnIndex];
+    const loserId = active?.id ?? this.roomState.burningBlock.playerId ?? null;
+
+    const updatedBlocks = this.roomState.blocks.map((b) =>
+      b.id === burnBlockId
+        ? { ...b, isRemoved: true, effect: null, hasMysteryPowerUp: false }
+        : b
+    );
+    const updatedStableBlocks = this.roomState.lastStableBlocks.map((b) =>
+      b.id === burnBlockId
+        ? { ...b, effect: null, hasMysteryPowerUp: false }
+        : b
+    );
+
+    this.roomState = {
+      ...this.roomState,
+      blocks: updatedBlocks,
+      lastStableBlocks: updatedStableBlocks,
+      burningBlock: null,
+    };
+
+    if (this.roomState.rulesMode === 'ELIMINATION' && loserId) {
+      await this.eliminatePlayerAndRestore(
+        loserId,
+        `${active?.name ?? 'Active player'}'s block burned away after 10s and they were ELIMINATED!`
+      );
+      return;
+    }
+
+    const ended = this.buildEndedState(this.roomState, loserId, 'TOWER_COLLAPSED');
+    await this.commitAndBroadcastState(ended);
+    await this.broadcastSystemChat(
+      `🔥 ${active?.name ?? 'Active player'}'s block burned to ash! Game Over!`,
+      '🔥'
+    );
   }
 
   private async handleTurnTimeout(allowBackup = false): Promise<void> {
@@ -372,16 +433,21 @@ class SupabaseRoomController {
       this.roomState,
       this.roomState.currentTurnIndex
     );
-    const stableBlocks = sanitizeStableBlocks(
+    const sanitized = sanitizeStableBlocks(
       this.roomState.blocks,
       this.roomState.lastStableBlocks
     );
+    const powerUpsOn = this.roomState.powerUpsEnabled !== false;
+    const stableBlocks = powerUpsOn ? maybeSpawnMysteryBlock(sanitized) : sanitized;
     const nextState: RoomState = {
       ...this.roomState,
       status: 'PLAYING',
       settlingStartedAt: null,
       turnStartedAt: this.getServerNow(),
       currentTurnIndex: nextTurnIndex,
+      burningBlock: null,
+      lastEliminatedPlayerId: null,
+      lastEliminatedAt: null,
       blocks: cloneBlocks(stableBlocks),
       lastStableBlocks: cloneBlocks(stableBlocks),
     };
@@ -424,9 +490,12 @@ class SupabaseRoomController {
       const ended: RoomState = {
         ...this.roomState,
         status: 'GAME_OVER',
-        players: updatedPlayers,
+        players: updatedPlayers.map((p) => ({ ...p, powerUp: null })),
         settlingStartedAt: null,
         activeBlockId: null,
+        burningBlock: null,
+        blocks: clearAllPowerUpsOnBlocks(this.roomState.blocks),
+        lastStableBlocks: clearAllPowerUpsOnBlocks(this.roomState.lastStableBlocks),
         lastEliminatedPlayerId: loserId,
         lastEliminatedAt: now,
         loserId,
@@ -441,11 +510,12 @@ class SupabaseRoomController {
       return;
     }
 
+    const powerUpsOn = this.roomState.powerUpsEnabled !== false;
     const restoredBlocks = sanitizeStableBlocks(
       this.roomState.lastStableBlocks.length > 0
         ? this.roomState.lastStableBlocks
-        : createInitialBlocks(),
-      createInitialBlocks()
+        : createInitialBlocks(powerUpsOn),
+      createInitialBlocks(powerUpsOn)
     );
     const nextTurnIndex = this.findNextConnectedPlayerIndex(
       this.roomState,
@@ -461,6 +531,7 @@ class SupabaseRoomController {
       turnStartedAt: now,
       settlingStartedAt: null,
       activeBlockId: null,
+      burningBlock: null,
       blocks: restoredBlocks,
       lastStableBlocks: cloneBlocks(restoredBlocks),
       towerRestoreVersion: (this.roomState.towerRestoreVersion ?? 1) + 1,
@@ -489,20 +560,19 @@ class SupabaseRoomController {
     return {
       ...state,
       status: 'GAME_OVER',
+      players: state.players.map((p) => ({ ...p, powerUp: null })),
+      blocks: clearAllPowerUpsOnBlocks(state.blocks),
+      lastStableBlocks: clearAllPowerUpsOnBlocks(state.lastStableBlocks),
       settlingStartedAt: null,
       activeBlockId: null,
+      burningBlock: null,
       loserId,
       winnerId: winner?.id ?? null,
       gameOverReason: reason,
     };
   }
 
-  private applyLocalRoomState(nextState: RoomState, updatedAtIso?: string | null): void {
-    // Calibrate clock if Postgres trigger stamped serverTimestampMs or updated_at
-    if (nextState.serverTimestampMs || updatedAtIso) {
-      this.calibrateServerClock(nextState.serverTimestampMs, updatedAtIso, Date.now());
-    }
-
+  private applyLocalRoomState(nextState: RoomState): void {
     const prev = this.roomState;
     const normalized: RoomState = { ...nextState };
     const serverNow = this.getServerNow();
@@ -534,6 +604,23 @@ class SupabaseRoomController {
       }
     }
 
+    if (normalized.burningBlock) {
+      const isFreshBurn =
+        !prev?.burningBlock ||
+        prev.burningBlock.blockId !== normalized.burningBlock.blockId;
+      if (isFreshBurn && Math.abs(serverNow - normalized.burningBlock.startedAt) > 600) {
+        normalized.burningBlock = {
+          ...normalized.burningBlock,
+          startedAt: serverNow,
+        };
+      } else if (normalized.burningBlock.startedAt > serverNow) {
+        normalized.burningBlock = {
+          ...normalized.burningBlock,
+          startedAt: serverNow,
+        };
+      }
+    }
+
     if (
       prev &&
       ((normalized.towerRestoreVersion ?? 1) > (prev.towerRestoreVersion ?? 1) ||
@@ -558,6 +645,7 @@ class SupabaseRoomController {
           room_id: state.roomId,
           status: state.status,
           state,
+          updated_at: new Date(this.getServerNow()).toISOString(),
         },
         { onConflict: 'room_id' }
       )
@@ -571,16 +659,15 @@ class SupabaseRoomController {
     }
 
     const row = data as { state?: RoomState; updated_at?: string } | null;
-    if (row) {
+    if (row?.state) {
       const midpoint = t0 + (t1 - t0) / 2;
-      this.calibrateServerClock(
-        row.state?.serverTimestampMs ?? null,
-        row.updated_at ?? null,
-        midpoint
-      );
-      if (row.state) {
-        return row.state;
+      if (
+        typeof row.state.serverTimestampMs === 'number' &&
+        row.state.serverTimestampMs !== state.serverTimestampMs
+      ) {
+        this.calibrateServerClock(row.state.serverTimestampMs, null, midpoint);
       }
+      return row.state;
     }
     return state;
   }
@@ -704,7 +791,7 @@ class SupabaseRoomController {
           const row = payload.new as RoomRow | undefined;
           if (!row?.state) return;
           if (!this.roomState || this.shouldAdoptDbState(this.roomState, row.state)) {
-            this.applyLocalRoomState(row.state, row.updated_at);
+            this.applyLocalRoomState(row.state);
           }
         }
       )
@@ -740,13 +827,30 @@ class SupabaseRoomController {
   private shouldAdoptDbState(local: RoomState, incoming: RoomState): boolean {
     if ((incoming.towerRestoreVersion ?? 1) > (local.towerRestoreVersion ?? 1)) return true;
     if (incoming.rulesMode !== local.rulesMode) return true;
+    if (Boolean(incoming.powerUpsEnabled ?? true) !== Boolean(local.powerUpsEnabled ?? true)) {
+      return true;
+    }
     if (incoming.blocksMovedCount > local.blocksMovedCount) return true;
     if (incoming.status !== local.status) return true;
     if (incoming.currentTurnIndex !== local.currentTurnIndex) return true;
     if (incoming.turnStartedAt !== local.turnStartedAt) return true;
     if (incoming.settlingStartedAt !== local.settlingStartedAt) return true;
+    if ((incoming.burningBlock?.blockId ?? null) !== (local.burningBlock?.blockId ?? null)) {
+      return true;
+    }
     if (incoming.players.length !== local.players.length) return true;
+    if (incoming.players.some((p, i) => p.powerUp !== local.players[i]?.powerUp)) return true;
     if (incoming.activeBlockId !== local.activeBlockId) return true;
+    if (
+      incoming.blocks.some(
+        (b, i) =>
+          b.effect !== local.blocks[i]?.effect ||
+          b.hasMysteryPowerUp !== local.blocks[i]?.hasMysteryPowerUp ||
+          b.isRemoved !== local.blocks[i]?.isRemoved
+      )
+    ) {
+      return true;
+    }
     return false;
   }
 
@@ -898,6 +1002,7 @@ class SupabaseRoomController {
       roomId,
       status: 'WAITING',
       rulesMode: 'CLASSIC',
+      powerUpsEnabled: true,
       players: [hostPlayer],
       currentTurnIndex: 0,
       startingPlayerIndex: 0,
@@ -1047,6 +1152,20 @@ class SupabaseRoomController {
     await this.commitAndBroadcastState(nextState);
   }
 
+  public async setPowerUpsEnabled(enabled: boolean): Promise<void> {
+    if (!this.roomState || this.roomState.status !== 'WAITING') return;
+    const me = this.roomState.players.find((p) => p.id === this.clientId);
+    if (!me?.isHost) return;
+    const freshBlocks = createInitialBlocks(enabled);
+    const nextState: RoomState = {
+      ...this.roomState,
+      powerUpsEnabled: enabled,
+      blocks: freshBlocks,
+      lastStableBlocks: cloneBlocks(freshBlocks),
+    };
+    await this.commitAndBroadcastState(nextState);
+  }
+
   public async startGame(): Promise<void> {
     if (!this.roomState) return;
     const me = this.roomState.players.find((p) => p.id === this.clientId);
@@ -1056,9 +1175,11 @@ class SupabaseRoomController {
     }
     if (this.roomState.status !== 'WAITING') return;
 
-    const freshBlocks = createInitialBlocks();
+    const powerUpsOn = this.roomState.powerUpsEnabled !== false;
+    const freshBlocks = createInitialBlocks(powerUpsOn);
     const nextState: RoomState = {
       ...this.roomState,
+      powerUpsEnabled: powerUpsOn,
       status: 'PLAYING',
       startingPlayerIndex: 0,
       currentTurnIndex: 0,
@@ -1070,10 +1191,12 @@ class SupabaseRoomController {
         ...p,
         score: 0,
         eliminated: false,
+        powerUp: null,
       })),
       winnerId: null,
       loserId: null,
       gameOverReason: null,
+      burningBlock: null,
       blocks: freshBlocks,
       lastStableBlocks: cloneBlocks(freshBlocks),
       towerRestoreVersion: 1,
@@ -1134,12 +1257,140 @@ class SupabaseRoomController {
       payload: { blockId, playerId: this.clientId, committed },
     });
 
-    if (committed && this.roomState.activeBlockId !== blockId) {
-      const nextState: RoomState = {
-        ...this.roomState,
-        activeBlockId: blockId,
+    if (!committed) return;
+
+    const targetBlock = this.roomState.blocks.find((b) => b.id === blockId);
+    const powerUpsOn = this.roomState.powerUpsEnabled !== false;
+    let grantedPowerUp: PowerUpType | null = null;
+    const collectedPowerUp = powerUpsOn && Boolean(targetBlock?.hasMysteryPowerUp);
+    const startedBurn =
+      powerUpsOn &&
+      targetBlock?.effect === 'BURN' &&
+      this.roomState.burningBlock?.blockId !== blockId;
+    const needsCommit =
+      this.roomState.activeBlockId !== blockId || collectedPowerUp || startedBurn;
+
+    if (!needsCommit) return;
+
+    let nextPlayers = this.roomState.players;
+    let nextBlocks = this.roomState.blocks;
+    let nextStableBlocks = this.roomState.lastStableBlocks;
+    let nextBurning = this.roomState.burningBlock ?? null;
+
+    if (collectedPowerUp) {
+      grantedPowerUp = Math.random() < 0.5 ? 'ICE_BLOCK' : 'BURNING_HAND';
+      nextPlayers = nextPlayers.map((p, idx) =>
+        idx === this.roomState!.currentTurnIndex ? { ...p, powerUp: grantedPowerUp } : p
+      );
+      nextBlocks = nextBlocks.map((b) =>
+        b.id === blockId ? { ...b, hasMysteryPowerUp: false } : b
+      );
+      nextStableBlocks = nextStableBlocks.map((b) =>
+        b.id === blockId ? { ...b, hasMysteryPowerUp: false } : b
+      );
+    }
+
+    if (startedBurn) {
+      nextBurning = {
+        blockId,
+        playerId: active.id,
+        startedAt: this.getServerNow(),
+        durationMs: BURN_DURATION_MS,
       };
-      void this.commitAndBroadcastState(nextState);
+    }
+
+    const nextState: RoomState = {
+      ...this.roomState,
+      activeBlockId: blockId,
+      players: nextPlayers,
+      blocks: nextBlocks,
+      lastStableBlocks: nextStableBlocks,
+      burningBlock: nextBurning,
+      lastEliminatedPlayerId: null,
+      lastEliminatedAt: null,
+    };
+
+    void this.commitAndBroadcastState(nextState);
+
+    if (grantedPowerUp) {
+      const label = grantedPowerUp === 'ICE_BLOCK' ? 'Ice Block' : 'Burning Hand';
+      const icon = grantedPowerUp === 'ICE_BLOCK' ? '🧊' : '🔥';
+      void this.broadcastSystemChat(
+        `${active.name} unlocked ${icon} ${label} from a Mystery Block!`,
+        icon
+      );
+    }
+    if (startedBurn) {
+      void this.broadcastSystemChat(
+        `🔥 ${active.name} picked up a BURNING block! Place it within 10s!`,
+        '🔥'
+      );
+    }
+  }
+
+  public async usePowerUp(blockId: number): Promise<void> {
+    if (
+      !this.roomState ||
+      this.roomState.status !== 'PLAYING' ||
+      this.roomState.powerUpsEnabled === false
+    ) {
+      return;
+    }
+    const active = this.roomState.players[this.roomState.currentTurnIndex];
+    if (!active || active.id !== this.clientId || !active.powerUp) return;
+
+    const targetBlock = this.roomState.blocks.find((b) => b.id === blockId);
+    if (!targetBlock || targetBlock.isRemoved) return;
+
+    const powerUp = active.powerUp;
+    const nextEffect = powerUp === 'ICE_BLOCK' ? 'ICE' : 'BURN';
+
+    const nextPlayers = this.roomState.players.map((p, idx) =>
+      idx === this.roomState!.currentTurnIndex ? { ...p, powerUp: null } : p
+    );
+    const nextBlocks = this.roomState.blocks.map((b) =>
+      b.id === blockId
+        ? { ...b, effect: nextEffect as 'ICE' | 'BURN', hasMysteryPowerUp: false }
+        : b
+    );
+    const nextStableBlocks = this.roomState.lastStableBlocks.map((b) =>
+      b.id === blockId
+        ? { ...b, effect: nextEffect as 'ICE' | 'BURN', hasMysteryPowerUp: false }
+        : b
+    );
+
+    const startBurnNow =
+      nextEffect === 'BURN' && this.roomState.activeBlockId === blockId;
+    const nextBurning = startBurnNow
+      ? {
+          blockId,
+          playerId: active.id,
+          startedAt: this.getServerNow(),
+          durationMs: BURN_DURATION_MS,
+        }
+      : this.roomState.burningBlock ?? null;
+
+    const nextState: RoomState = {
+      ...this.roomState,
+      players: nextPlayers,
+      blocks: nextBlocks,
+      lastStableBlocks: nextStableBlocks,
+      burningBlock: nextBurning,
+      lastEliminatedPlayerId: null,
+      lastEliminatedAt: null,
+    };
+
+    await this.commitAndBroadcastState(nextState);
+    if (powerUp === 'ICE_BLOCK') {
+      await this.broadcastSystemChat(
+        `🧊 ${active.name} froze Block #${blockId + 1} with Ice Block!`,
+        '🧊'
+      );
+    } else {
+      await this.broadcastSystemChat(
+        `🔥 ${active.name} cursed Block #${blockId + 1} with Burning Hand!`,
+        '🔥'
+      );
     }
   }
 
@@ -1196,6 +1447,7 @@ class SupabaseRoomController {
             position: finalTransform.position,
             quaternion: finalTransform.quaternion,
             isRemoved: false,
+            effect: null,
           }
         : b
     );
@@ -1205,6 +1457,9 @@ class SupabaseRoomController {
       status: 'SETTLING',
       settlingStartedAt: this.getServerNow(),
       activeBlockId: null,
+      burningBlock: null,
+      lastEliminatedPlayerId: null,
+      lastEliminatedAt: null,
       blocksMovedCount: this.roomState.blocksMovedCount + 1,
       players: nextPlayers,
       blocks: nextBlocks,
@@ -1245,22 +1500,26 @@ class SupabaseRoomController {
       ...p,
       score: 0,
       eliminated: false,
+      powerUp: null,
     }));
     const nextStarter = this.findNextConnectedPlayerIndex(
       this.roomState,
       this.roomState.startingPlayerIndex,
       resetPlayers
     );
-    const freshBlocks = createInitialBlocks();
+    const powerUpsOn = this.roomState.powerUpsEnabled !== false;
+    const freshBlocks = createInitialBlocks(powerUpsOn);
 
     const nextState: RoomState = {
       ...this.roomState,
+      powerUpsEnabled: powerUpsOn,
       status: 'PLAYING',
       startingPlayerIndex: nextStarter,
       currentTurnIndex: nextStarter,
       turnStartedAt: this.getServerNow(),
       settlingStartedAt: null,
       activeBlockId: null,
+      burningBlock: null,
       blocksMovedCount: 0,
       players: resetPlayers,
       blocks: freshBlocks,
